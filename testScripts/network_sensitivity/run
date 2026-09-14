@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Top-level entry point for the network-sensitivity evaluation
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+RTT_DIR="$ROOT_DIR/testScripts/network_sensitivity/rtt_scan"
+LOSS_DIR="$ROOT_DIR/testScripts/network_sensitivity/loss"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bash testScripts/network_sensitivity/run [--mode rtt|loss|all]
+
+Options:
+  --mode rtt    Run RTT dense scan only
+  --mode loss   Run random loss experiment only
+  --mode all    Run both (default)
+EOF
+}
+
+MODE="${1:-all}"
+case "$MODE" in
+    --mode)
+        MODE="${2:-}"
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+case "$MODE" in
+    rtt|loss|all)
+        ;;
+    *)
+        echo "[ERR] unsupported mode: ${MODE:-<empty>}"
+        usage
+        exit 1
+        ;;
+esac
+
+if [[ "$MODE" == "rtt" || "$MODE" == "all" ]]; then
+    echo "[STEP] network sensitivity: RTT scan"
+    sudo bash "$RTT_DIR/run"
+fi
+
+if [[ "$MODE" == "loss" || "$MODE" == "all" ]]; then
+    echo "[STEP] network sensitivity: packet loss"
+    sudo bash "$LOSS_DIR/run"
+fi
+
+echo "[OK] network-sensitivity evaluation completed"

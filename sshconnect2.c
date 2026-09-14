@@ -1383,6 +1383,10 @@ input_userauth_kem_info_req(int type, u_int32_t seq, struct ssh *ssh)
 		r = SSH_ERR_INVALID_FORMAT;
 		goto out;
 	}
+	if (ciphertext_len != ssh_kem_ciphertext_len(kem)) {
+		r = SSH_ERR_INVALID_FORMAT;
+		goto out;
+	}
 	if ((response_len = ssh_kem_response_len(alg)) == 0) {
 		r = SSH_ERR_INVALID_FORMAT;
 		goto out;

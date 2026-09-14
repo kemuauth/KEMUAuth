@@ -1,0 +1,592 @@
+#!/usr/bin/env bash
+# Figure 3 — End-to-end SSH handshake latency while varying the
+# client-authentication algorithm.
+#
+# Published experiment configuration:
+#   Transport KEX    = mlkem768x25519-sha256
+#   Server HostKey   = ssh-ed25519
+#   RTT              = approximately 67 ms
+#   TCP MSS          = 1460 bytes
+#   TCP initcwnd     = 10 MSS
+#   Measurement      = client-observed wall-clock latency of a fresh SSH invocation
+#   Reported metrics = Mean / P50 / P95
+#   Measured samples = 5000 handshakes per configuration
+#
+# Client-authentication configurations (13):
+#
+#   Signature-based publickey:
+#     ed25519
+#     md44
+#     md65
+#     md87
+#     falcon512
+#     falcon1024
+#     sd128f
+#     sd192f
+#     sd256f
+#
+#   KEMUAuth publickey-kem:
+#     mk512
+#     mk768
+#     mk1024
+#
+#   Password baseline:
+#     password
+#
+# Measurements are collected in interleaved rounds. Within each round,
+# the algorithm order is shuffled to reduce systematic bias from slow
+# environmental drift.
+#
+# The default ITERATIONS value is intentionally smaller than the published
+# 5000-handshake campaign so that this script remains practical for
+# reproducibility and functional checks.
+#
+# The WARMUP parameter controls additional unreported warm-up rounds. It is an
+# artifact-side option and is not part of the published 5000-sample count.
+#
+# Usage:
+#
+#   Quick/default reproduction:
+#     sudo bash testScripts/figure3/run
+#
+#   Very short functional check:
+#     sudo env ITERATIONS=5 WARMUP=1 \
+#       bash testScripts/figure3/run
+#
+#   Paper-scale measurement count:
+#     sudo env ITERATIONS=5000 RTT_MS=67 INITCWND_MSS=10 \
+#       bash testScripts/figure3/run
+#
+# Overridable environment variables:
+#   ITERATIONS=200   measured samples per authentication configuration
+#   WARMUP=5         unreported warm-up interleaved rounds
+#   RTT_MS=67        target RTT in milliseconds
+#   INITCWND_MSS=10  TCP initial congestion window in MSS
+#   TEST_USER        dedicated test account
+#   TEST_PASSWORD    test-account password
+#   TEST_PORT        dedicated sshd port
+#   KEEP_WORKDIR=1   preserve the experiment work directory
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BACKENDS_DIR="$ROOT_DIR/testScripts/backends"
+
+# ---- Must be set before sourcing sshd_test_harness.sh ----
+TEST_PORT="${TEST_PORT:-42320}"
+TEST_USER="${TEST_USER:-ssh_fig3_test}"
+TEST_PASSWORD="${TEST_PASSWORD:-testpwd_12345}"
+
+source "$BACKENDS_DIR/sshd_test_harness.sh"
+source "$BACKENDS_DIR/netem_setup.sh"
+
+# ---- Parameters ----
+RTT_MS="${RTT_MS:-67}"
+INITCWND_MSS="${INITCWND_MSS:-10}"
+NETEM_IFACE="${NETEM_IFACE:-lo}"
+NETEM_TARGET_MTU="${NETEM_TARGET_MTU:-1500}"
+FORCE_DISABLE_OFFLOAD="${FORCE_DISABLE_OFFLOAD:-1}"
+ITERATIONS="${ITERATIONS:-200}"
+WARMUP="${WARMUP:-5}"
+TEST_HOST="${TEST_HOST:-127.0.0.1}"
+SETUP_ACCOUNT="${SETUP_ACCOUNT:-1}"
+KEEP_WORKDIR="${KEEP_WORKDIR:-1}"
+
+WORK_DIR="${WORK_DIR:-$ROOT_DIR/testScripts/.work-figure3}"
+RESULT_DIR="${RESULT_DIR:-$SCRIPT_DIR/results}"
+
+# ---- Root check ----
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "[ERR] Figure 3 experiment requires root (account creation + network emulation)"
+  echo "[HINT] run: sudo bash $0"
+  exit 1
+fi
+
+# ---- Prerequisite checks ----
+check_ssh_binaries || exit 1
+need_cmd tc || exit 1
+need_cmd ip || exit 1
+need_cmd setsid || exit 1
+if [[ "$FORCE_DISABLE_OFFLOAD" == "1" && "$NETEM_IFACE" == "lo" ]]; then
+  need_cmd ethtool || exit 1
+fi
+
+# ---- Cleanup leftovers (precise match; never kill system sshd) ----
+pkill -f "sshd.*-f.*${WORK_DIR}/sshd.conf" 2>/dev/null || true
+find /sys/fs/cgroup -maxdepth 1 -name "ssh-*" -type d 2>/dev/null | while read d; do rmdir "$d" 2>/dev/null || true; done
+sleep 1
+
+mkdir -p "$WORK_DIR" "$RESULT_DIR"
+
+# =====================================================================
+# Network environment: netem RTT + initcwnd + loopback offload + MTU
+# =====================================================================
+NETEM_DELAY_MS="$(awk -v rtt="$RTT_MS" 'BEGIN { printf "%.3f", rtt/2.0 }')"
+ORIG_LOCAL_ROUTE=""
+LOCAL_ROUTE_TOUCHED=0
+ORIG_IFACE_MTU=""
+IFACE_MTU_TOUCHED=0
+ORIG_LO_TSO=""
+ORIG_LO_GSO=""
+ORIG_LO_GRO=""
+OFFLOAD_TOUCHED=0
+
+get_offload_state() {
+  local feature="$1"
+  ethtool -k "$NETEM_IFACE" 2>/dev/null | awk -v f="$feature" '$1 == f":" {print $2; exit}'
+}
+
+enforce_lo_offload_settings() {
+  if [[ "$FORCE_DISABLE_OFFLOAD" != "1" || "$NETEM_IFACE" != "lo" ]]; then
+    return 0
+  fi
+  ORIG_LO_TSO="$(get_offload_state tcp-segmentation-offload)"
+  ORIG_LO_GSO="$(get_offload_state generic-segmentation-offload)"
+  ORIG_LO_GRO="$(get_offload_state generic-receive-offload)"
+  if [[ -z "$ORIG_LO_TSO" || -z "$ORIG_LO_GSO" || -z "$ORIG_LO_GRO" ]]; then
+    echo "[ERR] failed to read lo offload state"
+    exit 1
+  fi
+  if [[ "$ORIG_LO_TSO" != "off" || "$ORIG_LO_GSO" != "off" || "$ORIG_LO_GRO" != "off" ]]; then
+    echo "[INFO] disable lo offload: tso=$ORIG_LO_TSO gso=$ORIG_LO_GSO gro=$ORIG_LO_GRO"
+    ethtool -K "$NETEM_IFACE" tso off gso off gro off
+    OFFLOAD_TOUCHED=1
+  fi
+}
+
+enforce_iface_mtu() {
+  local current_mtu
+  current_mtu="$(ip -o link show "$NETEM_IFACE" | awk '{for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}')"
+  [[ -z "$current_mtu" ]] && { echo "[ERR] failed to query MTU"; exit 1; }
+  ORIG_IFACE_MTU="$current_mtu"
+  if [[ "$current_mtu" != "$NETEM_TARGET_MTU" ]]; then
+    echo "[INFO] adjust $NETEM_IFACE MTU: $current_mtu -> $NETEM_TARGET_MTU"
+    ip link set dev "$NETEM_IFACE" mtu "$NETEM_TARGET_MTU"
+    IFACE_MTU_TOUCHED=1
+  fi
+}
+
+enforce_initcwnd() {
+  if [[ "$TEST_HOST" != 127.* || "$NETEM_IFACE" != "lo" ]]; then
+    echo "[ERR] initcwnd enforcement only supported for 127.* + lo"
+    exit 1
+  fi
+  ORIG_LOCAL_ROUTE="$(ip route show table local 127.0.0.0/8 dev lo | head -n1)"
+  [[ -z "$ORIG_LOCAL_ROUTE" ]] && { echo "[ERR] failed to locate loopback local route"; exit 1; }
+  LOCAL_ROUTE_TOUCHED=1
+  ip route replace table local local 127.0.0.0/8 dev lo proto kernel scope host src 127.0.0.1 initcwnd "$INITCWND_MSS"
+  if ! ip route show table local 127.0.0.0/8 dev lo | grep -q "initcwnd $INITCWND_MSS"; then
+    echo "[ERR] initcwnd not applied"
+    exit 1
+  fi
+  echo "[INFO] initcwnd=$INITCWND_MSS enforced on loopback"
+}
+
+cleanup() {
+  if [[ -n "${SSHD_PID:-}" ]] && kill -0 "$SSHD_PID" 2>/dev/null; then
+    kill "$SSHD_PID" 2>/dev/null || true
+    wait "$SSHD_PID" 2>/dev/null || true
+  fi
+  if [[ "$LOCAL_ROUTE_TOUCHED" == "1" && -n "$ORIG_LOCAL_ROUTE" ]]; then
+    ip route replace table local $ORIG_LOCAL_ROUTE >/dev/null 2>&1 || true
+  fi
+  if [[ "$IFACE_MTU_TOUCHED" == "1" && -n "$ORIG_IFACE_MTU" ]]; then
+    ip link set dev "$NETEM_IFACE" mtu "$ORIG_IFACE_MTU" >/dev/null 2>&1 || true
+  fi
+  if [[ "$OFFLOAD_TOUCHED" == "1" && "$NETEM_IFACE" == "lo" ]]; then
+    ethtool -K "$NETEM_IFACE" tso "$ORIG_LO_TSO" gso "$ORIG_LO_GSO" gro "$ORIG_LO_GRO" >/dev/null 2>&1 || true
+  fi
+  clear_netem "$NETEM_IFACE" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# =====================================================================
+# Test account (shared by password and pubkey/KEM auth)
+# =====================================================================
+setup_test_account() {
+  if id "$TEST_USER" >/dev/null 2>&1; then
+    echo "[INFO] test user '$TEST_USER' already exists"
+  else
+    echo "[INFO] creating test user: $TEST_USER"
+    useradd -m -s /bin/bash "$TEST_USER" 2>/dev/null || {
+      echo "[ERR] failed to create user $TEST_USER"
+      exit 1
+    }
+  fi
+  echo "${TEST_USER}:${TEST_PASSWORD}" | chpasswd 2>/dev/null || {
+    echo "[ERR] failed to set password for $TEST_USER"
+    exit 1
+  }
+  local hash_entry
+  hash_entry="$(grep "^$TEST_USER:" /etc/shadow 2>/dev/null | head -1)"
+  if echo "$hash_entry" | grep -q '^\$y\$'; then
+    echo "[INFO] password uses yescrypt"
+  else
+    echo "[WARN] password hash prefix: $(echo "$hash_entry" | cut -d: -f2 | cut -c1-20)"
+  fi
+  mkdir -p "/home/$TEST_USER"
+  chown "$TEST_USER:$TEST_USER" "/home/$TEST_USER" 2>/dev/null || true
+  mkdir -p "/home/$TEST_USER/.ssh"
+  chown "$TEST_USER:$TEST_USER" "/home/$TEST_USER/.ssh" 2>/dev/null || true
+  chmod 700 "/home/$TEST_USER/.ssh" 2>/dev/null || true
+}
+
+if [[ "$SETUP_ACCOUNT" == "1" ]]; then
+  setup_test_account
+fi
+
+# =====================================================================
+# Keys and identities
+# =====================================================================
+HOST_KEY="$(gen_host_key_ed25519 "$WORK_DIR")"
+KNOWN_HOSTS="$(gen_known_hosts "$WORK_DIR" "$HOST_KEY.pub")"
+
+# paper_alg|auth_mode|impl_alg|keygen_type -- used for probing/generation
+# empty keygen_type means KEM identity (via generate_kem_identity.sh)
+CASE_SPECS=(
+  "ed25519|publickey|ssh-ed25519|ed25519"
+  "md44|publickey|ssh-mldsa-44|mldsa-44"
+  "md65|publickey|ssh-mldsa-65|mldsa-65"
+  "md87|publickey|ssh-mldsa-87|mldsa-87"
+  "falcon512|publickey|ssh-falcon512|falcon512"
+  "falcon1024|publickey|ssh-falcon1024|falcon1024"
+  "sd128f|publickey|ssh-slhdsapuresha2128f|ssh-slhdsapuresha2128f"
+  "sd192f|publickey|ssh-slhdsapuresha2192f|ssh-slhdsapuresha2192f"
+  "sd256f|publickey|ssh-slhdsapuresha2256f|ssh-slhdsapuresha2256f"
+  "mk512|publickey-kem|ML-KEM-512|ML-KEM-512"
+  "mk768|publickey-kem|ML-KEM-768|ML-KEM-768"
+  "mk1024|publickey-kem|ML-KEM-1024|ML-KEM-1024"
+  "password|password|yescrypt|-"
+)
+
+# Authorized key files must live under TEST_USER's own home. The test sshd
+# drops privileges to TEST_USER during authentication, so directories owned
+# by the invoking user may not be traversable by the test account.
+AUTHORIZED_KEYS="/home/$TEST_USER/.ssh/authorized_keys"
+AUTHORIZED_KEM_KEYS="/home/$TEST_USER/.ssh/authorized_kem_keys"
+: > "$AUTHORIZED_KEYS"
+: > "$AUTHORIZED_KEM_KEYS"
+
+extract_kem_public() { awk 'BEGIN{IGNORECASE=1} $1 ~ /^public$/ {print $2; exit}' "$1"; }
+
+RUNTIME_SPECS=()   # runnable cases: paper_alg|auth_mode|impl_alg|id_file
+declare -A ALG_IDFILE ALG_IMPL ALG_AUTH
+
+for spec in "${CASE_SPECS[@]}"; do
+  IFS='|' read -r paper_alg auth_mode impl_alg keygen_type <<< "$spec"
+  id_file=""
+
+  if [[ "$auth_mode" == "publickey" ]]; then
+    if ! "$SSH_BIN" -Q key 2>/dev/null | grep -Fxq "$impl_alg"; then
+      echo "[WARN] $paper_alg ($impl_alg) not supported by ssh -Q key; skipping"
+      continue
+    fi
+    id_file="$WORK_DIR/id_${paper_alg}"
+    if [[ ! -f "$id_file" || ! -f "$id_file.pub" ]]; then
+      if ! "$SSH_KEYGEN_BIN" -q -t "$keygen_type" -N "" -f "$id_file" >/dev/null 2>&1; then
+        echo "[WARN] ssh-keygen -t $keygen_type failed for $paper_alg; skipping"
+        continue
+      fi
+      chown "$TEST_USER" "$id_file" "$id_file.pub" 2>/dev/null || true
+    fi
+    cat "$id_file.pub" >> "$AUTHORIZED_KEYS"
+
+  elif [[ "$auth_mode" == "publickey-kem" ]]; then
+    id_file="$WORK_DIR/id_${paper_alg}"
+    if [[ ! -f "$id_file" ]]; then
+      if ! bash "$BACKENDS_DIR/generate_kem_identity.sh" "$id_file" "$keygen_type" >/dev/null 2>&1; then
+        echo "[WARN] KEM identity generation failed for $paper_alg; skipping"
+        continue
+      fi
+    fi
+    pub="$(extract_kem_public "$id_file" || true)"
+    if [[ -n "$pub" ]]; then
+      printf '%s %s\n' "$impl_alg" "$pub" >> "$AUTHORIZED_KEM_KEYS"
+    fi
+
+  else # password
+    if ! id "$TEST_USER" >/dev/null 2>&1; then
+      echo "[WARN] test user missing for password; skipping"
+      continue
+    fi
+    id_file=""
+  fi
+
+  RUNTIME_SPECS+=("$paper_alg|$auth_mode|$impl_alg|$id_file")
+  ALG_IDFILE[$paper_alg]="$id_file"
+  ALG_IMPL[$paper_alg]="$impl_alg"
+  ALG_AUTH[$paper_alg]="$auth_mode"
+done
+
+ALL_ALGS=()
+for spec in "${RUNTIME_SPECS[@]}"; do
+  IFS='|' read -r paper_alg _ _ _ <<< "$spec"
+  ALL_ALGS+=("$paper_alg")
+done
+
+if (( ${#ALL_ALGS[@]} == 0 )); then
+  echo "[ERR] no runnable algorithms"
+  exit 1
+fi
+echo "[INFO] algorithms: ${ALL_ALGS[*]}"
+
+# Own the authorized files to TEST_USER (read by sshd after privilege drop)
+chown "$TEST_USER:$TEST_USER" "$AUTHORIZED_KEYS" "$AUTHORIZED_KEM_KEYS" 2>/dev/null || true
+chmod 644 "$AUTHORIZED_KEYS" "$AUTHORIZED_KEM_KEYS" 2>/dev/null || true
+
+# =====================================================================
+# sshd config: password + pubkey + KEM all enabled
+# =====================================================================
+SSHD_CFG="$WORK_DIR/sshd.conf"
+SSHD_LOG="$WORK_DIR/sshd.log"
+cat > "$SSHD_CFG" <<EOF
+Port $TEST_PORT
+ListenAddress $TEST_HOST
+PidFile $WORK_DIR/sshd.pid
+HostKey $HOST_KEY
+HostKeyAlgorithms ssh-ed25519
+KexAlgorithms mlkem768x25519-sha256
+LogLevel ERROR
+SshdSessionPath $SSHD_SESSION_BIN
+SshdAuthPath $SSHD_AUTH_BIN
+
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PubkeyAcceptedAlgorithms ssh-ed25519,ssh-mldsa-44,ssh-mldsa-65,ssh-mldsa-87,ssh-falcon512,ssh-falcon1024,ssh-slhdsapuresha2128f,ssh-slhdsapuresha2192f,ssh-slhdsapuresha2256f
+KEMAuthentication yes
+KEMAuthAlgorithms ML-KEM-512,ML-KEM-768,ML-KEM-1024
+AuthorizedKeysFile $AUTHORIZED_KEYS
+AuthorizedKEMKeysFile $AUTHORIZED_KEM_KEYS
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitRootLogin no
+
+MaxStartups 256
+MaxSessions 1
+LoginGraceTime 120
+StrictModes no
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PrintMotd no
+EOF
+
+# ---- SSH_ASKPASS password input script (for password auth) ----
+ASKPASS_SCRIPT="$WORK_DIR/ssh_askpass.sh"
+cat > "$ASKPASS_SCRIPT" <<EOF
+#!/bin/bash
+echo "$TEST_PASSWORD"
+EOF
+chmod +x "$ASKPASS_SCRIPT"
+
+# =====================================================================
+# Result files
+# =====================================================================
+RAW_CSV="$RESULT_DIR/raw_runs.csv"
+SUMMARY_CSV="$RESULT_DIR/summary.csv"
+READABLE_MD="$RESULT_DIR/readable.md"
+META_TXT="$RESULT_DIR/metadata.txt"
+
+echo "alg,round,phase,iter,latency_ms,success,retcode,auth_mode" > "$RAW_CSV"
+
+# =====================================================================
+# Apply network environment and start sshd
+# =====================================================================
+enforce_iface_mtu
+enforce_lo_offload_settings
+enforce_initcwnd
+echo "[INFO] netem: iface=$NETEM_IFACE RTT=${RTT_MS}ms (one-way ${NETEM_DELAY_MS}ms)"
+set_netem_delay "$NETEM_IFACE" "$RTT_MS"
+
+# Pre-check that the host key is readable (by root)
+if ! "$SSH_KEYGEN_BIN" -y -f "$HOST_KEY" >/dev/null 2>&1; then
+  echo "[ERR] cannot read host key $HOST_KEY"
+  exit 1
+fi
+
+"$SSHD_BIN" -D -f "$SSHD_CFG" -E "$SSHD_LOG" &
+SSHD_PID=$!
+SSHD_UP=0
+for _ in $(seq 1 200); do
+  if { exec 3<>"/dev/tcp/$TEST_HOST/$TEST_PORT"; } 2>/dev/null; then
+    exec 3>&- || true
+    exec 3<&- || true
+    SSHD_UP=1
+    break
+  fi
+  read -r -t 0.05 _ || true
+done
+if [[ "$SSHD_UP" != "1" ]]; then
+  echo "[ERR] sshd did not accept connections on $TEST_HOST:$TEST_PORT within ~10s"
+  echo "[ERR] sshd alive? $(kill -0 "$SSHD_PID" 2>/dev/null && echo yes || echo no)"
+  echo "----- sshd.log (tail) -----"
+  cat "$SSHD_LOG" 2>/dev/null | tail -50 || true
+  echo "----- port state -----"
+  ss -tlnp 2>/dev/null | grep "$TEST_PORT" || echo "no listener on $TEST_PORT"
+  echo "----- ps -----"
+  ps -o pid,ppid,user,stat,cmd -p "$SSHD_PID" 2>/dev/null || true
+  kill "$SSHD_PID" 2>/dev/null || true
+  exit 1
+fi
+echo "[INFO] sshd PID=$SSHD_PID on port $TEST_PORT"
+
+# ---- Startup self-check: verify auth path works under root + netem ----
+ID_ED25519_SELF="$WORK_DIR/id_ed25519"
+if [[ -f "$ID_ED25519_SELF" ]]; then
+  echo "[INFO] self-check: ed25519 publickey connection..."
+  if ! "$SSH_BIN" -o StrictHostKeyChecking=no -o UserKnownHostsFile="$KNOWN_HOSTS" \
+    -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+    -o ConnectTimeout=30 -o KexAlgorithms=mlkem768x25519-sha256 \
+    -o HostKeyAlgorithms=ssh-ed25519 -o PreferredAuthentications=publickey \
+    -o PubkeyAcceptedAlgorithms=ssh-ed25519 -o IdentityFile="$ID_ED25519_SELF" \
+    -o KEMAuthentication=no -p "$TEST_PORT" "$TEST_USER@$TEST_HOST" true >/dev/null 2>&1; then
+    echo "[ERR] self-check ed25519 connection FAILED"
+    echo "[ERR] retrying with -vvv to capture client-side error:"
+    "$SSH_BIN" -vvv -o StrictHostKeyChecking=no -o UserKnownHostsFile="$KNOWN_HOSTS" \
+      -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+      -o ConnectTimeout=30 -o KexAlgorithms=mlkem768x25519-sha256 \
+      -o HostKeyAlgorithms=ssh-ed25519 -o PreferredAuthentications=publickey \
+      -o PubkeyAcceptedAlgorithms=ssh-ed25519 -o IdentityFile="$ID_ED25519_SELF" \
+      -o KEMAuthentication=no -p "$TEST_PORT" "$TEST_USER@$TEST_HOST" true 2>&1 | tail -60 || true
+    echo "----- sshd.log (tail) -----"
+    cat "$SSHD_LOG" 2>/dev/null | tail -50 || true
+    echo "----- port state -----"
+    ss -tlnp 2>/dev/null | grep "$TEST_PORT" || echo "no listener on $TEST_PORT"
+    exit 1
+  fi
+  echo "[INFO] self-check OK (ed25519 auth works)"
+fi
+
+# =====================================================================
+# Single connection measurement (dispatch client opts by auth_mode)
+# =====================================================================
+run_once() {
+  local paper_alg="$1" round="$2" phase="$3"
+  local auth_mode="${ALG_AUTH[$paper_alg]}"
+  local impl_alg="${ALG_IMPL[$paper_alg]}"
+  local id_file="${ALG_IDFILE[$paper_alg]}"
+  local rc=0 start_ep end_ep lat_ms success
+
+  start_ep="$(date +%s.%N)"
+  case "$auth_mode" in
+    publickey)
+      "$SSH_BIN" \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -o BatchMode=yes -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no -o ConnectTimeout=30 \
+        -o ControlMaster=no -o ControlPersist=no \
+        -o KexAlgorithms=mlkem768x25519-sha256 \
+        -o HostKeyAlgorithms=ssh-ed25519 \
+        -o PreferredAuthentications=publickey \
+        -o PubkeyAcceptedAlgorithms="$impl_alg" \
+        -o IdentityFile="$id_file" -o KEMAuthentication=no \
+        -p "$TEST_PORT" "$TEST_USER@$TEST_HOST" true >/dev/null 2>&1 || rc=$?
+      ;;
+    publickey-kem)
+      "$SSH_BIN" \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -o BatchMode=yes -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no -o ConnectTimeout=30 \
+        -o ControlMaster=no -o ControlPersist=no \
+        -o KexAlgorithms=mlkem768x25519-sha256 \
+        -o HostKeyAlgorithms=ssh-ed25519 \
+        -o PreferredAuthentications=publickey-kem \
+        -o PubkeyAuthentication=no -o KEMAuthentication=yes \
+        -o KEMAuthAlgorithms="$impl_alg" \
+        -o IdentityKEMFile="$id_file" \
+        -p "$TEST_PORT" "$TEST_USER@$TEST_HOST" true >/dev/null 2>&1 || rc=$?
+      ;;
+    password)
+      SSH_ASKPASS="$ASKPASS_SCRIPT" SSH_ASKPASS_REQUIRE=force DISPLAY=dummy:0 \
+        setsid "$SSH_BIN" \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -o BatchMode=no -o PasswordAuthentication=yes \
+        -o KbdInteractiveAuthentication=no -o ConnectTimeout=30 \
+        -o ControlMaster=no -o ControlPersist=no \
+        -o KexAlgorithms=mlkem768x25519-sha256 \
+        -o HostKeyAlgorithms=ssh-ed25519 \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no -o KEMAuthentication=no \
+        -p "$TEST_PORT" "$TEST_USER@$TEST_HOST" true >/dev/null 2>&1 || rc=$?
+      ;;
+  esac
+  end_ep="$(date +%s.%N)"
+  lat_ms="$(python3 -c "s=$start_ep;e=$end_ep;print(f'{(e-s)*1000:.3f}')" 2>/dev/null || echo NA)"
+  success=0; [[ "$rc" -eq 0 ]] && success=1
+  # interleaved: one sample per algorithm per round, so iter equals round
+  echo "$paper_alg,$round,$phase,$round,$lat_ms,$success,$rc,$auth_mode" >> "$RAW_CSV"
+}
+
+# =====================================================================
+# Interleaved polling (shuf algorithm order each round, one sample each)
+# =====================================================================
+shuffle_algs() {
+  printf '%s\n' "${ALL_ALGS[@]}" | shuf | tr '\n' ' '
+}
+
+echo ""
+echo "================================================"
+echo "  Figure 3 - client-authentication algorithm comparison"
+echo "  RTT=${RTT_MS}ms  initcwnd=${INITCWND_MSS}  iterations=$ITERATIONS warmup=$WARMUP"
+echo "  algorithms (${#ALL_ALGS[@]}): ${ALL_ALGS[*]}"
+echo "================================================"
+echo ""
+
+echo "[$(date +%H:%M:%S)] warmup phase ($WARMUP rounds)..."
+for ((i=1; i<=WARMUP; i++)); do
+  for alg in $(shuffle_algs); do
+    run_once "$alg" "$i" "warmup"
+  done
+done
+
+echo "[$(date +%H:%M:%S)] measure phase ($ITERATIONS rounds)..."
+for ((i=1; i<=ITERATIONS; i++)); do
+  for alg in $(shuffle_algs); do
+    run_once "$alg" "$i" "measure"
+  done
+  if (( i % 10 == 0 )); then
+    echo "[$(date +%H:%M:%S)] interleaved round $i/$ITERATIONS"
+  fi
+done
+
+echo ""
+echo "================================================"
+echo "  Measurement complete, generating summary..."
+echo "================================================"
+
+# =====================================================================
+# Summarize
+# =====================================================================
+python3 "$SCRIPT_DIR/analyze.py" \
+  "$RAW_CSV" "$SUMMARY_CSV" "$READABLE_MD" \
+  "$RTT_MS" "$INITCWND_MSS" "$ITERATIONS" "$WARMUP" || {
+  echo "[ERR] analyze.py failed"
+  exit 1
+}
+
+cat > "$META_TXT" <<EOF
+experiment=figure3
+objective=client-authentication-algorithm-comparison
+kex=mlkem768x25519-sha256
+server_hostkey=ssh-ed25519
+rtt_target_ms=$RTT_MS
+initcwnd_mss=$INITCWND_MSS
+iterations=$ITERATIONS
+warmup=$WARMUP
+total_measurements=$((ITERATIONS * ${#ALL_ALGS[@]}))
+test_user=$TEST_USER
+algorithms=${ALL_ALGS[*]}
+timestamp=$(date -Iseconds)
+hostname=$(hostname)
+cpu_model=$(lscpu 2>/dev/null | grep 'Model name' | sed 's/Model name:[[:space:]]*//' || echo NA)
+kernel=$(uname -r)
+openssh_commit=$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo NA)
+raw_csv=$RAW_CSV
+summary_csv=$SUMMARY_CSV
+EOF
+
+echo "[OK] Figure 3 experiment completed"
+echo "[ARTIFACT] $SUMMARY_CSV"
+echo "[ARTIFACT] $READABLE_MD"
+echo "[ARTIFACT] $RAW_CSV"

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run the experiments corresponding to Figures 3–5 of the ICNP 2026 paper.
+#
+# Other evaluations reported in the extended paper, including concurrency,
+# network-sensitivity, and implementation checks, have separate entry points
+# under testScripts/.
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "[ERR] root or sudo is required for network-emulation experiments."
+        exit 1
+    fi
+
+    echo "[INFO] A one-time sudo authentication is required for network setup."
+    sudo -v
+fi
+
+echo "[STEP] Figure 3 — Client-authentication algorithm comparison"
+if [[ "$(id -u)" -eq 0 ]]; then
+    bash "$ROOT_DIR/testScripts/figure3/run"
+else
+    sudo bash "$ROOT_DIR/testScripts/figure3/run"
+fi
+
+echo "[STEP] Figure 4 — Migration configurations across RTT regimes"
+bash "$ROOT_DIR/testScripts/figure4/run"
+
+echo "[STEP] Figure 5 — TCP initial-window sensitivity"
+bash "$ROOT_DIR/testScripts/figure5/run"
+
+echo "[OK] Main-figure experiments completed."
+
+echo "[RESULTS] Figure 3:"
+echo "  $ROOT_DIR/testScripts/figure3/results"
+
+echo "[RESULTS] Figure 4:"
+echo "  $ROOT_DIR/testScripts/figure4/results/test2-C"
+echo "  $ROOT_DIR/testScripts/figure4/results/test2-I"
+echo "  $ROOT_DIR/testScripts/figure4/results/test2-L"
+
+echo "[RESULTS] Figure 5:"
+echo "  $ROOT_DIR/testScripts/figure5/results/test3"

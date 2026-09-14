@@ -1,341 +1,444 @@
-# KEMUAuth: KEM-Based-User-Authentication-for-Post-Quantum-SSH (Anonymous Research Artifact)
+# KEMUAuth: KEM-Based Client Authentication for Post-Quantum SSH
 
-This repository is an research artifact for evaluating KEM-based user authentication in SSH based on OQS-openSSHv10.
+KEMUAuth is a research implementation of **KEM-based client authentication for
+SSH**. It replaces signature-based client proof of possession with a KEM-based
+challenge-response mechanism while preserving the existing SSH transport
+handshake and the overall SSH user-authentication framework.
 
-## Anonymous Statement
+This repository contains the OpenSSH-based implementation, build infrastructure,
+and evaluation scripts associated with the paper:
 
-This artifact is prepared for anonymous review. Repository-specific personal identifiers are intentionally minimized in the project-owned scripts and documentation.
+> **A Drop-in KEM Replacement for Client Signatures in Post-Quantum SSH**
+> Accepted at IEEE ICNP 2026.
 
-## Scope
+## Repository Status
 
-This repository uses a full-source distribution approach so reviewers can build and run experiments directly.
+This branch is the **paper-aligned ICNP 2026 implementation**.
 
-Core contribution focus:
-- KEM user-authentication workflow integration in the SSH stack.
-- Reproducible experiment wrappers under [testScripts](testScripts) for paper-aligned evaluations.
-- Controlled network emulation for RTT and TCP initcwnd experiments.
+It is intended to preserve the implementation and evaluation environment
+corresponding to the camera-ready paper and the extended arXiv version. The
+experiment organization, published numerical results, and reproduction
+instructions in this branch are maintained to match the published work.
 
-Non-core items are intentionally not expanded into separate benchmark suites if they are not central to the KEM user-authentication claim.
+Two narrowly scoped post-artifact robustness hardening changes are present in
+this branch: explicit client-side KEM ciphertext-length validation and safer
+test-only malformed-ciphertext mutation instrumentation. These changes do not
+alter the valid KEMUAuth protocol flow. The original ICNP artifact
+implementation is preserved by the tag `icnp-2026-original-artifact`.
+
+Future standards-oriented development may refine protocol details, wire
+formats, algorithm negotiation, implementation structure, and testing
+infrastructure. Such development should take place on the project's main
+development branch rather than modifying the historical paper-aligned behavior
+in this branch.
+
+## KEMUAuth Overview
+
+The KEMUAuth client-authentication method follows the SSH public-key
+authentication structure but replaces the client's signature proof with a
+KEM-based proof of possession.
+
+At a high level:
+
+1. The client advertises a KEM public key and KEMUAuth algorithm.
+2. The server encapsulates to the registered client KEM public key and returns
+   the resulting ciphertext as an authentication challenge.
+3. The client decapsulates the ciphertext and derives an authentication
+   response from the resulting shared secret and session-bound context.
+4. The server verifies the response and accepts the client authentication if
+   the proof is valid.
+
+The implementation is integrated at the SSH user-authentication layer and does
+not replace the SSH transport key exchange.
+
+The primary SSH authentication method implemented in this repository is:
+
+```text
+publickey-kem
+```
+
+The source tree also contains experimental hybrid authentication paths used by
+the paper's migration evaluation.
+
+## Source-Code Map
+
+The most relevant KEMUAuth implementation files include:
+
+```text
+ssh-kem.c
+ssh-kem.h
+auth2-kem.c
+auth2-kem.h
+```
+
+Client-side SSH integration is implemented in the modified OpenSSH client
+authentication path, while server-side processing is integrated into the
+OpenSSH user-authentication subsystem.
+
+The remainder of the repository contains the underlying OpenSSH/OQS-OpenSSH
+source tree and supporting build infrastructure.
 
 ## Repository Layout
 
-- Build helpers:
-  - [oqs-scripts/clone_liboqs.sh](oqs-scripts/clone_liboqs.sh)
-  - [oqs-scripts/build_liboqs.sh](oqs-scripts/build_liboqs.sh)
-  - [oqs-scripts/build_openssh.sh](oqs-scripts/build_openssh.sh)
-- Reviewer-facing experiments:
-  - [testScripts/run_all](testScripts/run_all)
-  - [testScripts/test1/test1](testScripts/test1/test1)
-  - [testScripts/fig3_rerun/run](testScripts/fig3_rerun/run) — unified Figure-3 dataset (13 algorithms)
-  - [testScripts/test2/test2](testScripts/test2/test2)
-  - [testScripts/test3/test3](testScripts/test3/test3)
-  - Backend runners in [testScripts/backends](testScripts/backends)
-- Supplementary experiments (revision):
-  - [testScripts/supp_concurrency/run](testScripts/supp_concurrency/run) — Server concurrency: throughput + pending memory
-  - [testScripts/supp_ciphertext_robustness/run](testScripts/supp_ciphertext_robustness/run) — Ciphertext robustness
-  - [testScripts/supp_rtt_loss/run](testScripts/supp_rtt_loss/run) — RTT dense scan + packet loss
-  - Pre-computed results in each `reference_data.md`
-- Experiment notes:
-  - [testScripts/plan.md](testScripts/plan.md)
-
-## Build
-
-
-Recommended environment: Linux with sudo privileges for network shaping.
-
-### Versions
-
-- OpenSSH: 10.2p1 (OQS-OpenSSH 2025-12 fork)
-- liboqs: 0.15.0 (AVX2-optimized ML-KEM, ML-DSA, SLH-DSA/FN-DSA, Falcon)
-- OpenSSL: 3.0.2
-- Build flow: `oqs-scripts/clone_liboqs.sh` → `oqs-scripts/build_liboqs.sh` → `oqs-scripts/build_openssh.sh`
-
-### Quick Build (Recommended)
-
-1. Build liboqs:
-  ```bash
-  bash oqs-scripts/clone_liboqs.sh
-  bash oqs-scripts/build_liboqs.sh
-  ```
-
-2. Build OQS-OpenSSH:
-  ```bash
-  bash oqs-scripts/build_openssh.sh
-  ```
-
-After building, the ssh, sshd, ssh-keygen and related binaries will appear in the repository root or in the oqs-test/tmp directory.
-
----
-
-### Manual Build (for custom configuration or debugging)
-
-If you need to customize build parameters or wish to debug the build process manually, follow these steps:
-
-1. Install dependencies (example for Ubuntu/Debian):
-  ```bash
-  sudo apt-get update
-  sudo apt-get install -y autoconf automake libtool make gcc g++ pkg-config libssl-dev zlib1g-dev
-  ```
-
-2. In the repository root, generate the configure script (if not already present):
-  ```bash
-  autoreconf -i
-  ```
-
-3. Configure build parameters (adjust --prefix, --with-liboqs-dir, etc. as needed):
-  ```bash
-  ./configure --prefix="$PWD/oqs-test/tmp" --with-liboqs-dir="$PWD/oqs" --with-ssl-dir=/usr --with-cflags="-I$PWD/oqs-test/tmp/include"
-  ```
-
-4. Build and install:
-  ```bash
-  make -j
-  make install
-  ```
-
-5. The resulting ssh/sshd/ssh-keygen binaries will be located in `$PWD/oqs-test/tmp`.
-
-For more configure options, run `./configure --help`.
-
-You may also refer to the `oqs-scripts/build_openssh.sh` script for an automated version of these steps.
-
-## Experiments
-
-> **Note:** All tests and pre-computed results in this repository are provided for reference and
-> comparative evaluation only. Absolute latency, throughput, and resource figures depend on host
-> hardware, kernel version, system load, and network conditions. They are not intended as
-> strict performance guarantees across platforms.
-
-Run all experiments in one command:
-
-```bash
-bash testScripts/run_all
+```text
+.
+├── ssh-kem.c / ssh-kem.h
+│   └── Shared KEMUAuth/KEM support
+├── auth2-kem.c / auth2-kem.h
+│   └── Server-side KEMUAuth user authentication
+├── oqs-scripts/
+│   └── liboqs and OpenSSH build helpers
+├── testScripts/
+│   ├── figure3/
+│   ├── figure4/
+│   ├── figure5/
+│   ├── concurrency/
+│   ├── network_sensitivity/
+│   ├── implementation_checks/
+│   └── backends/
+└── README.md
 ```
 
-### Test 1 (Figure-3 style, unified 13-algorithm dataset)
+For experiment-specific documentation, see:
 
-The unified Figure-3 dataset compares 13 client-authentication algorithms in one
-campaign (RTT=67ms, initcwnd=10 MSS, server host-key Ed25519): Ed25519,
-ML-DSA-44/65/87, Falcon-512/1024, SLH-DSA-SHA2-128f/192f/256f, ML-KEM-512/768/1024,
-and Password (yescrypt). It replaces the earlier separate test1 (10 algorithms),
-supp_falcon, and supp_password tables. Requires root (test account, tc, ip route,
-initcwnd/offload setup).
-
-```bash
-sudo bash testScripts/fig3_rerun/run
+```text
+testScripts/README.md
 ```
 
-Defaults:
-- iterations=2000
-- warmup=5
-- RTT=67ms
-- initcwnd=10
+## Build Environment
 
-Quick smoke / overrides:
+The paper evaluation environment uses:
 
-```bash
-sudo env ITERATIONS=5 WARMUP=1 bash testScripts/fig3_rerun/run
-```
+- Ubuntu 22.04.5 LTS
+- GCC 11.4
+- OpenSSL 3.0.2
+- liboqs 0.15.0
+- AVX2-enabled compilation where supported
 
-Pre-computed results: [testScripts/test1/reference_data.md](testScripts/test1/reference_data.md)
+A Linux environment is strongly recommended. Several evaluation scripts also
+require `sudo` privileges for Linux network configuration.
 
-A lightweight 10-algorithm variant (no Falcon/Password) remains at
-`testScripts/test1/test1` for fast checks:
+### Install Build Dependencies
 
-```bash
-bash testScripts/test1/test1
-```
-
-### Test 2 (Figure-4 style, close/intermediate/long RTT)
+On Ubuntu/Debian:
 
 ```bash
-bash testScripts/test2/test2
+sudo apt-get update
+sudo apt-get install -y \
+  autoconf \
+  automake \
+  libtool \
+  make \
+  gcc \
+  g++ \
+  pkg-config \
+  libssl-dev \
+  zlib1g-dev
 ```
 
-Defaults:
-- rounds=1
-- iterations=50
-- warmup=5
-- initcwnd=10
-- profiles: all (close/intermediate/long)
+### Build liboqs
 
-Optional overrides:
+From the repository root:
 
 ```bash
-bash testScripts/test2/test2 --profile intermediate --iterations 100 --rounds 2 --warmup 10
+LIBOQS_BRANCH=0.15.0 bash oqs-scripts/clone_liboqs.sh
+bash oqs-scripts/build_liboqs.sh
 ```
 
-Supported profiles:
-- all
-- close
-- intermediate
-- long
+The repository-local liboqs installation is placed under:
 
-### Test 3 (Figure-5 style, 11 initcwnd points)
+```text
+oqs/
+```
+
+### Build KEMUAuth / OQS-OpenSSH
+
+Run:
 
 ```bash
-bash testScripts/test3/test3
+bash oqs-scripts/build_openssh.sh
 ```
 
-Defaults:
-- rounds=1
-- iterations=50
-- warmup=5
-- RTT=67ms
-- initcwnd list: 3 5 7 10 15 20 25 30 35 40 50
+After a successful build, KEMUAuth-enabled OpenSSH binaries such as:
 
-Optional overrides:
+```text
+ssh
+sshd
+ssh-keygen
+```
+
+are available from the repository build tree.
+
+A successful KEMUAuth build can also be checked with:
 
 ```bash
-bash testScripts/test3/test3 --iterations 100 --rounds 2 --warmup 10 --rtt 67 --initcwnd-list "3 5 7 10 15 20 25 30 35 40 50"
+grep WITH_OQS config.h
 ```
 
-### Supplementary Experiments: Prerequisites
+and by inspecting the supported OpenSSH algorithms.
 
-Some supplementary experiments require special build flags and system setup:
+## Paper Reproduction
 
-**Build with instrumentation flags:**
+The evaluation scripts are organized according to the final paper rather than
+the internal experiment numbering used during development.
+
+### Figure 3 — Client-Authentication Algorithm Comparison
 
 ```bash
-# For ciphertext robustness (Exp 3):
-grep KEM_TEST_MUTATION config.h || echo '#define KEM_TEST_MUTATION 1' >> config.h
-make -j4 ssh sshd sshd-session sshd-auth ssh-keygen
-
-# For server concurrency (Exps 1 & 2):
-grep KEM_TEST_INSTRUMENTATION config.h || echo '#define KEM_TEST_INSTRUMENTATION 1' >> config.h
-make -j4 ssh sshd sshd-session sshd-auth ssh-keygen
+sudo bash testScripts/figure3/run
 ```
 
-> Building without these flags produces normal OpenSSH binaries; the flags only activate
-> measurement hooks used by the experiments below.
+Figure 3 compares classical signatures, post-quantum signatures, KEMUAuth
+configurations, and the password baseline under a fixed network environment.
 
-**cgroup v2 (required by server concurrency experiments):**
+Documentation:
+
+```text
+testScripts/figure3/README.md
+```
+
+Published paper values:
+
+```text
+testScripts/figure3/published_results.md
+```
+
+### Figure 4 — Migration Configurations across RTT Regimes
 
 ```bash
-# Check if cgroup v2 is available:
-test -f /sys/fs/cgroup/cgroup.controllers && echo "cgroup v2 OK" || echo "cgroup v2 NOT available"
-# If not, add "systemd.unified_cgroup_hierarchy=1" to kernel cmdline and reboot.
+bash testScripts/figure4/run
 ```
 
-**Network interface (required by RTT/loss experiments):**
+Figure 4 evaluates eight client/server authentication migration configurations
+under approximately 37 ms, 67 ms, and 163 ms RTTs.
 
-The RTT and loss experiments apply `tc netem` rules to the loopback interface (`lo`).
-`ethtool` offload disable is attempted but non-fatal; if `lo` does not support `ethtool`,
-the experiments still run correctly.
+The paper-aligned runner explicitly selects the combined classical/post-quantum
+authentication paths used by the hybrid configurations.
 
-**KEM identities (required by all supplementary experiments):**
+Documentation:
+
+```text
+testScripts/figure4/README.md
+```
+
+Published paper values:
+
+```text
+testScripts/figure4/published_results.md
+```
+
+### Figure 5 — TCP Initial-Window Sensitivity
 
 ```bash
-bash test/step1/gen_kem_identity_mlkem768.sh
+bash testScripts/figure5/run
 ```
 
-**Runtime estimates (2-core VM, 67 ms RTT where applicable):**
+Figure 5 studies authentication-object transmission effects by varying the TCP
+initial congestion window over:
 
-| Experiment | Approx. Runtime |
-|:---|:---|
-| Test 1 (unified 13-alg, iterations=2000) | ~6.3 h |
-| Test 2 (all 3 profiles) | ~15 min |
-| Test 3 (11 initcwnd points) | ~10 min |
-| Throughput cgroup | ~30 min |
-| Pending memory | ~20 min |
-| Ciphertext robustness | ~5 min |
-| RTT dense scan | ~40 min |
-| Packet loss | ~25 min |
+```text
+3 5 7 10 15 20 25 30 35 40 50 MSS
+```
 
----
+Documentation:
 
-### Supplementary: Server Concurrency (Revision)
+```text
+testScripts/figure5/README.md
+```
 
-Two experiments that measure server-side behaviour under controlled concurrency:
-(1) full-SSH throughput at N = 1,8,16,32,64 concurrent clients with cgroup CPU/memory
-accounting, and (2) per-connection memory cost of pending KEM challenges as a function of
-concurrency P.
+Published paper values:
 
-Requires `KEM_TEST_INSTRUMENTATION` build flag and cgroup v2 (see prerequisites above).
+```text
+testScripts/figure5/published_results.md
+```
+
+### Run the Three Main Figure Experiments
+
+The main paper experiment runners can be invoked sequentially with:
 
 ```bash
-sudo bash testScripts/supp_concurrency/run
+bash testScripts/run_main_figures
 ```
 
-| Sub-experiment | Description | Pre-computed Results |
-|:---|:---|:---|
-| `throughput_cgroup/` | Full-SSH throughput with cgroup v2 CPU/memory isolation | [reference_data.md](testScripts/supp_concurrency/throughput_cgroup/reference_data.md) |
-| `pending_memory/` | Pending KEM challenge memory growth: $M(P)=\alpha+\beta P$ | [reference_data.md](testScripts/supp_concurrency/pending_memory/reference_data.md) |
+The default runners intentionally use reduced sample counts so that users can
+validate the build, authentication configuration, networking setup, and
+result-processing pipeline without immediately executing the complete
+paper-scale campaign.
 
-Run individually:
+The paper-scale end-to-end measurements use 5,000 measured SSH handshakes per
+configuration. See each figure-specific README for the corresponding
+reproduction command and experiment-specific settings.
+
+## Published Results and Local Reproduction
+
+The repository distinguishes between the numerical results reported in the
+paper and results generated by a new local execution.
+
+Files named:
+
+```text
+published_results.md
+```
+
+contain the canonical values reported in the paper.
+
+Files generated under experiment-specific:
+
+```text
+results/
+```
+
+directories represent a new local reproduction run.
+
+Timing measurements may vary across machines because of hardware, CPU
+frequency, kernel behavior, scheduling, system load, and networking
+configuration. The published values therefore serve as reference measurements,
+not platform-independent performance guarantees.
+
+## Extended Evaluation
+
+The extended evaluation is organized independently from the three main figure
+experiments.
+
+### Concurrency
+
+```text
+testScripts/concurrency/
+```
+
+This evaluation studies server-side behavior under concurrent KEMUAuth
+connections, including:
+
+```text
+throughput_cgroup/
+pending_memory/
+```
+
+Entry point:
+
 ```bash
-sudo bash testScripts/supp_concurrency/run --mode throughput
-sudo bash testScripts/supp_concurrency/run --mode pending
+bash testScripts/concurrency/run
 ```
 
-### Supplementary: Ciphertext Robustness (Revision)
+Some concurrency measurements require cgroup v2 and the
+`KEM_TEST_INSTRUMENTATION` build option.
 
-Malformed-ciphertext robustness and timing sanity checks for ML-KEM-768 KEM user
-authentication. Two test modes:
+### Network Sensitivity
 
-- **Protocol-level** (`--mode protocol`): Sends mutated ciphertexts through a live
-  SSH connection and records whether the server rejects them with consistent error
-  codes (no distinguishable timing leak). Requires `sudo`.
-- **Local decaps** (`--mode local`): Micro-benchmark that calls the ML-KEM-768
-  decapsulation API directly with valid and mutated ciphertexts; measures whether
-  decapsulation time differs between valid and invalid inputs. Runs without `sudo`.
+```text
+testScripts/network_sensitivity/
+```
 
-Requires `KEM_TEST_MUTATION` build flag (see prerequisites above).
+This evaluation contains:
+
+```text
+rtt_scan/
+loss/
+```
+
+and studies handshake behavior across a denser RTT range and under random
+packet loss.
+
+Entry point:
 
 ```bash
-sudo bash testScripts/supp_ciphertext_robustness/run
+bash testScripts/network_sensitivity/run --mode all
 ```
 
-| Table | Mode | Command |
-|:---|:---|:---|
-| Table 1 — Protocol-level | `--mode protocol` | `sudo bash testScripts/supp_ciphertext_robustness/run --mode protocol` |
-| Table 2 — Local decaps | `--mode local` | `bash testScripts/supp_ciphertext_robustness/run --mode local` |
-
-Pre-computed results: [reference_data.md](testScripts/supp_ciphertext_robustness/reference_data.md)
-
-### Supplementary: RTT & Packet Loss (Revision)
-
-Two experiments extending the latency evaluation: (1) a dense RTT scan across
-9 points (0, 20, 40, 60, 80, 100, 120, 160, 200 ms) to verify smooth latency
-trends, and (2) random packet-loss sensitivity at 5 loss levels (0, 0.1, 0.5,
-1.0, 2.0%) with fixed 67 ms RTT. Both compare KEMUAuth (ML-KEM-768) vs ML-DSA-65.
-
-Applies `tc netem` on `lo`; requires `sudo` and `ip`/`tc`/`ping` installed.
+Individual modes are available through:
 
 ```bash
-sudo bash testScripts/supp_rtt_loss/run
+bash testScripts/network_sensitivity/run --mode rtt
+bash testScripts/network_sensitivity/run --mode loss
 ```
 
-| Sub-experiment | Description | Pre-computed Results |
-|:---|:---|:---|
-| `rtt_scan/` | 9 RTT points, 500 iterations each | [reference_data.md](testScripts/supp_rtt_loss/rtt_scan/reference_data.md) |
-| `loss/` | Random loss at 67 ms, 5 seeds × 200 iterations | [reference_data.md](testScripts/supp_rtt_loss/loss/reference_data.md) |
+### Ciphertext Robustness
 
-Run individually:
+```text
+testScripts/implementation_checks/ciphertext_robustness/
+```
+
+This implementation check evaluates malformed-ciphertext handling and related
+timing behavior.
+
+Entry point:
+
 ```bash
-sudo bash testScripts/supp_rtt_loss/run --mode rtt
-sudo bash testScripts/supp_rtt_loss/run --mode loss
+bash testScripts/implementation_checks/ciphertext_robustness/run
 ```
 
-## Outputs
+It requires the `KEM_TEST_MUTATION` build option.
 
-Each test generates a reviewer-facing output set:
-- raw_runs.csv
-- round_means_append.csv
-- summary.csv
-- readable.md
+Detailed requirements and result descriptions for these evaluations are
+documented under their respective directories.
 
-See [testScripts/plan.md](testScripts/plan.md) for mapping.
+## Runtime Workspaces
 
-## Notes on Reproducibility
+Some experiment scripts generate temporary SSH/KEM identities and runtime
+configuration files.
 
-- Network shaping depends on host load and scheduler behavior; small jitter is expected.
-- Results are for reproducibility and comparative evaluation, not a strict absolute-latency guarantee across all platforms.
-- If you publish results, align the environment with the paper setup for closest correspondence.
+In particular:
+
+```text
+testScripts/.work-kem/
+```
+
+is used as a local runtime workspace for generated KEM identity material.
+
+Runtime workspaces are excluded by `.gitignore` and must not be committed to
+the repository.
+
+## Project and Artifact History
+
+The initial public implementation was released through an anonymous GitHub
+account during the paper-review process.
+
+This repository is the maintained KEMUAuth project repository and preserves the
+historical relationship to that research artifact. The paper-aligned branch
+contains the cleaned and documented version of the implementation corresponding
+to the ICNP 2026 paper, while future protocol and standards-oriented development
+can evolve independently on the main development branch.
+
+The original anonymous artifact should be treated as a historical snapshot.
+For current project documentation, reproducibility instructions, and future
+development, use this repository.
+
+## Reproducibility Notes
+
+Network-sensitive experiments use Linux facilities such as:
+
+```text
+tc/netem
+ip route
+```
+
+and therefore commonly require root or `sudo` privileges.
+
+The evaluation scripts launch dedicated local SSH server instances for
+measurement and do not replace the host system's SSH daemon.
+
+Temporary keys, runtime configuration, and locally reproduced results should
+not be interpreted as source artifacts or published measurements.
+
+## Citation
+
+If you use KEMUAuth in academic work, please cite:
+
+> **A Drop-in KEM Replacement for Client Signatures in Post-Quantum SSH**
+> IEEE ICNP 2026.
+
+Complete proceedings metadata and persistent publication identifiers can be
+added here once the final bibliographic record is available.
 
 ## License
 
-This repository includes upstream OpenSSH/OQS components and follows their corresponding licenses.
+This repository incorporates and modifies OpenSSH/OQS-OpenSSH source code and
+includes components distributed under their respective licenses.
 
-Primary license references in this repository:
-- [LICENCE](LICENCE)
+See:
+
+```text
+LICENCE
+```
+
+and the upstream source headers for the applicable licensing terms.

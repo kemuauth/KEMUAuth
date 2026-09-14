@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+RUNNER="$ROOT_DIR/testScripts/backends/run_test2.sh"
+
+OUT_DIR="$ROOT_DIR/testScripts/figure4/results"
+
+# Default quick-reproduction settings (can be overridden by CLI options).
+ROUNDS="${ROUNDS:-1}"
+WARMUP="${WARMUP:-5}"
+ITERATIONS="${ITERATIONS:-50}"
+INITCWND_MSS="${INITCWND_MSS:-10}"
+NETEM_IFACE="${NETEM_IFACE:-lo}"
+TEST_HOST="${TEST_HOST:-127.0.0.1}"
+TEST_PORT="${TEST_PORT:-42320}"
+SUDO_BIN="${SUDO_BIN:-sudo}"
+SUDO_NONINTERACTIVE="${SUDO_NONINTERACTIVE:-0}"
+PROFILE="${PROFILE:-all}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bash testScripts/figure4/run [options]
+
+Options:
+  --rounds <n>         Number of rounds (default: 1)
+  --iterations <n>     Measured iterations per round (default: 50)
+  --warmup <n>         Warmup iterations per round (default: 5)
+  --initcwnd <mss>     initcwnd in MSS (default: 10)
+  --iface <name>       netem interface (default: lo)
+  --profile <name>     all|close|intermediate|long (default: all)
+  -h, --help           Show help
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --rounds)
+        ROUNDS="$2"
+        shift 2
+        ;;
+      --iterations)
+        ITERATIONS="$2"
+        shift 2
+        ;;
+      --warmup)
+        WARMUP="$2"
+        shift 2
+        ;;
+      --initcwnd)
+        INITCWND_MSS="$2"
+        shift 2
+        ;;
+      --iface)
+        NETEM_IFACE="$2"
+        shift 2
+        ;;
+      --profile)
+        PROFILE="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "[ERR] unknown argument: $1"
+        usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+parse_args "$@"
+
+case "$PROFILE" in
+  all|close|intermediate|long)
+    ;;
+  *)
+    echo "[ERR] unsupported profile: $PROFILE"
+    usage
+    exit 1
+    ;;
+esac
+
+us_ts() {
+  TZ=America/New_York date +%Y-%m-%dT%H:%M:%S%z
+}
+
+log_info() {
+  printf '[%s][INFO] %s\n' "$(us_ts)" "$*"
+}
+
+ORIG_LOCAL_ROUTE=""
+LOCAL_ROUTE_TOUCHED=0
+
+run_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+    return
+  fi
+  if ! command -v "$SUDO_BIN" >/dev/null 2>&1; then
+    echo "[ERR] sudo not found and current user is not root"
+    exit 1
+  fi
+  if [[ "$SUDO_NONINTERACTIVE" == "1" ]]; then
+    "$SUDO_BIN" -n "$@"
+  else
+    "$SUDO_BIN" "$@"
+  fi
+}
+
+enforce_initcwnd() {
+  if [[ "$TEST_HOST" != 127.* || "$NETEM_IFACE" != "lo" ]]; then
+    echo "[ERR] initcwnd auto-enforcement currently requires TEST_HOST=127.x and NETEM_IFACE=lo"
+    exit 1
+  fi
+
+  ORIG_LOCAL_ROUTE="$(ip route show table local 127.0.0.0/8 dev lo | head -n1)"
+  if [[ -z "$ORIG_LOCAL_ROUTE" ]]; then
+    echo "[ERR] failed to locate loopback local route for initcwnd"
+    exit 1
+  fi
+  LOCAL_ROUTE_TOUCHED=1
+
+  run_root ip route replace table local local 127.0.0.0/8 dev lo proto kernel scope host src 127.0.0.1 initcwnd "$INITCWND_MSS"
+  if ! ip route show table local 127.0.0.0/8 dev lo | grep -q "initcwnd $INITCWND_MSS"; then
+    echo "[ERR] initcwnd not applied to loopback route"
+    exit 1
+  fi
+}
+
+cleanup() {
+  if [[ "$LOCAL_ROUTE_TOUCHED" == "1" && -n "$ORIG_LOCAL_ROUTE" ]]; then
+    run_root ip route replace table local $ORIG_LOCAL_ROUTE >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if [[ ! -x "$RUNNER" ]]; then
+  echo "[ERR] missing runner: $RUNNER"
+  exit 1
+fi
+
+mkdir -p "$OUT_DIR"
+enforce_initcwnd
+
+run_one() {
+  local exp_id="$1"
+  local rtt_ms="$2"
+  local run_tag="$3"
+  local result_dir="$OUT_DIR/$run_tag"
+
+  log_info "Figure 4 profile=$run_tag start (RTT=${rtt_ms}ms)"
+
+  if ! EXP_ID="$exp_id" \
+  RTT_MS="$rtt_ms" \
+  ROUNDS="$ROUNDS" \
+  WARMUP="$WARMUP" \
+  ITERATIONS="$ITERATIONS" \
+  SERVER_HOSTKEY_MODE=and \
+  USE_NETEM=1 \
+  NETEM_IFACE="$NETEM_IFACE" \
+  NETEM_DELAY_MODE=half_rtt \
+  SUDO_NONINTERACTIVE="$SUDO_NONINTERACTIVE" \
+  TEST_HOST="$TEST_HOST" \
+  TEST_PORT="$TEST_PORT" \
+  RESULT_DIR="$result_dir" \
+  bash "$RUNNER"; then
+    echo "[ERR] backend runner failed for $run_tag."
+    exit 1
+  fi
+
+  log_info "Figure 4 profile=$run_tag backend finished"
+
+  # Normalize round output to a stable schema with US timestamp.
+  local raw_csv="$result_dir/raw_runs.csv"
+  local round_csv="$result_dir/round_means_append.csv"
+  local now_ts
+  now_ts="$(us_ts)"
+  echo "ts_us,round,case,mean_ms,count" > "$round_csv"
+  awk -F, -v ts="$now_ts" '
+    NR==1 { next }
+    $3=="measure" && $7==0 {
+      key=$2","$1
+      sum[key]+=$8
+      cnt[key]+=1
+    }
+    END {
+      for (k in sum) {
+        printf "%s,%s,%.3f,%d\n", ts, k, sum[k]/cnt[k], cnt[k]
+      }
+    }
+  ' "$raw_csv" | sort -t, -k2,2n -k3,3 >> "$round_csv"
+
+  rm -f "$result_dir"/*_tmp_*.csv
+  rm -f "$result_dir/cases_manifest.csv" "$result_dir/metadata.txt"
+}
+
+if [[ "$PROFILE" == "all" || "$PROFILE" == "close" ]]; then
+  run_one test2-C 37 test2-C
+fi
+if [[ "$PROFILE" == "all" || "$PROFILE" == "intermediate" ]]; then
+  run_one test2-I 67 test2-I
+fi
+if [[ "$PROFILE" == "all" || "$PROFILE" == "long" ]]; then
+  run_one test2-L 163 test2-L
+fi
+
+write_readable() {
+  local run_tag="$1"
+  local rtt="$2"
+  local summary_csv="$OUT_DIR/$run_tag/summary.csv"
+  local readable_md="$OUT_DIR/$run_tag/readable.md"
+
+  {
+    echo "# ${run_tag} (Generated)"
+    echo
+    echo "Run config: rounds=$ROUNDS, warmup=$WARMUP, iterations=$ITERATIONS, RTT=${rtt}ms, initcwnd=$INITCWND_MSS"
+    echo
+    echo "| Case | Client Algorithm | Server Algorithm | Mean (ms) | 50th (ms) | 95th (ms) |"
+    echo "|---|---|---|---:|---:|---:|"
+
+    while IFS='|' read -r case_name client_disp server_disp; do
+      row="$(awk -F, -v c="$case_name" '$1==c{print $0; exit}' "$summary_csv")"
+      if [[ -z "$row" ]]; then
+        echo "| $case_name | $client_disp | $server_disp | NA | NA | NA |"
+        continue
+      fi
+      IFS=',' read -r _case _client _server _status _reason mean p50 p95 _ <<< "$row"
+      echo "| $case_name | $client_disp | $server_disp | $mean | $p50 | $p95 |"
+    done <<'EOF'
+classic|ed25519|ed25519
+hybrid_md65_ed25519|md65 + ed25519|md65 + ed25519
+hybrid_sd192f_ed25519|sd192f + ed25519|sd192f + ed25519
+migration_kem768_server_md65_ed25519|mk768 + ed25519|md65 + ed25519
+migration_kem768_server_sd192f_ed25519|mk768 + ed25519|sd192f + ed25519
+chain_ed25519_to_md65|ed25519 -> md65|md65 + ed25519
+chain_ed25519_to_mk768|ed25519 -> mk768|md65 + ed25519
+pure_pq_userauth_path|mk768|md65
+EOF
+  } > "$readable_md"
+}
+
+if [[ "$PROFILE" == "all" || "$PROFILE" == "close" ]]; then
+  write_readable test2-C 37
+fi
+if [[ "$PROFILE" == "all" || "$PROFILE" == "intermediate" ]]; then
+  write_readable test2-I 67
+fi
+if [[ "$PROFILE" == "all" || "$PROFILE" == "long" ]]; then
+  write_readable test2-L 163
+fi
+
+echo "[OK] Figure 4 experiment completed"
+if [[ "$PROFILE" == "all" || "$PROFILE" == "close" ]]; then
+  echo "[ARTIFACT] $OUT_DIR/test2-C/raw_runs.csv"
+  echo "[ARTIFACT] $OUT_DIR/test2-C/round_means_append.csv"
+  echo "[ARTIFACT] $OUT_DIR/test2-C/summary.csv"
+  echo "[ARTIFACT] $OUT_DIR/test2-C/readable.md"
+fi
+if [[ "$PROFILE" == "all" || "$PROFILE" == "intermediate" ]]; then
+  echo "[ARTIFACT] $OUT_DIR/test2-I/raw_runs.csv"
+  echo "[ARTIFACT] $OUT_DIR/test2-I/round_means_append.csv"
+  echo "[ARTIFACT] $OUT_DIR/test2-I/summary.csv"
+  echo "[ARTIFACT] $OUT_DIR/test2-I/readable.md"
+fi
+if [[ "$PROFILE" == "all" || "$PROFILE" == "long" ]]; then
+  echo "[ARTIFACT] $OUT_DIR/test2-L/raw_runs.csv"
+  echo "[ARTIFACT] $OUT_DIR/test2-L/round_means_append.csv"
+  echo "[ARTIFACT] $OUT_DIR/test2-L/summary.csv"
+  echo "[ARTIFACT] $OUT_DIR/test2-L/readable.md"
+fi

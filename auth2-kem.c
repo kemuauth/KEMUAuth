@@ -135,16 +135,103 @@ auth2_kem_stop(struct ssh *ssh)
 static int
 send_kem_challenge(struct ssh *ssh, struct kem_authctxt *ctx)
 {
+	const u_char *wire_ciphertext = ctx->ciphertext;
+	size_t wire_ciphertext_len = ctx->ciphertext_len;
+#ifdef KEM_TEST_MUTATION
+	u_char *mutated_ciphertext = NULL;
+	const char *mutation;
+	size_t i, bit, nflips;
+	struct timespec ts;
+#endif
 	int r;
+
+#ifdef KEM_TEST_MUTATION
+	mutation = getenv("KEM_MUTATION_TYPE");
+
+	if (mutation != NULL && strcmp(mutation, "valid") != 0) {
+		if (strcmp(mutation, "truncated") == 0) {
+			if (ctx->ciphertext_len == 0) {
+				error_f("cannot truncate empty KEM ciphertext");
+				return SSH_ERR_INVALID_FORMAT;
+			}
+			wire_ciphertext_len = ctx->ciphertext_len - 1;
+		} else if (strcmp(mutation, "extended") == 0) {
+			mutated_ciphertext = xmalloc(ctx->ciphertext_len + 1);
+			memcpy(mutated_ciphertext, ctx->ciphertext,
+			    ctx->ciphertext_len);
+			mutated_ciphertext[ctx->ciphertext_len] = 0;
+			wire_ciphertext = mutated_ciphertext;
+			wire_ciphertext_len = ctx->ciphertext_len + 1;
+		} else {
+			mutated_ciphertext = xmalloc(ctx->ciphertext_len);
+			memcpy(mutated_ciphertext, ctx->ciphertext,
+			    ctx->ciphertext_len);
+
+			if (strcmp(mutation, "onebit") == 0) {
+				if (ctx->ciphertext_len == 0) {
+					free(mutated_ciphertext);
+					return SSH_ERR_INVALID_FORMAT;
+				}
+				bit = arc4random_uniform(
+				    (u_int32_t)(ctx->ciphertext_len * 8));
+				mutated_ciphertext[bit / 8] ^=
+				    (u_char)(1U << (bit % 8));
+			} else if (strcmp(mutation, "multibit") == 0) {
+				if (ctx->ciphertext_len == 0) {
+					free(mutated_ciphertext);
+					return SSH_ERR_INVALID_FORMAT;
+				}
+				nflips = (ctx->ciphertext_len * 8) / 100 + 1;
+				for (i = 0; i < nflips; i++) {
+					bit = arc4random_uniform(
+					    (u_int32_t)
+					    (ctx->ciphertext_len * 8));
+					mutated_ciphertext[bit / 8] ^=
+					    (u_char)(1U << (bit % 8));
+				}
+			} else if (strcmp(mutation, "random") == 0) {
+				arc4random_buf(mutated_ciphertext,
+				    ctx->ciphertext_len);
+			} else if (strcmp(mutation, "allzero") == 0) {
+				memset(mutated_ciphertext, 0,
+				    ctx->ciphertext_len);
+			} else if (strcmp(mutation, "allff") == 0) {
+				memset(mutated_ciphertext, 0xff,
+				    ctx->ciphertext_len);
+			} else {
+				error_f("unknown KEM ciphertext mutation: %s",
+				    mutation);
+				free(mutated_ciphertext);
+				return SSH_ERR_INVALID_FORMAT;
+			}
+
+			wire_ciphertext = mutated_ciphertext;
+		}
+	}
+#endif
 
 	if ((r = sshpkt_start(ssh, SSH2_MSG_USERAUTH_KEM_CHALLENGE)) != 0 ||
 	    (r = sshpkt_put_cstring(ssh, ctx->alg)) != 0 ||
-	    (r = sshpkt_put_string(ssh, ctx->public_key, ctx->public_key_len)) != 0 ||
-	    (r = sshpkt_put_string(ssh, ctx->ciphertext, ctx->ciphertext_len)) != 0 ||
-	    (r = sshpkt_send(ssh)) != 0) {
-		return r;
-	}
-	return 0;
+	    (r = sshpkt_put_string(ssh, ctx->public_key,
+	    ctx->public_key_len)) != 0 ||
+	    (r = sshpkt_put_string(ssh, wire_ciphertext,
+	    wire_ciphertext_len)) != 0 ||
+	    (r = sshpkt_send(ssh)) != 0)
+		goto out;
+
+#ifdef KEM_TEST_MUTATION
+	if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) == 0)
+		debug("KEM_CHALLENGE_EPOCH:%lld.%09ld",
+		    (long long)ts.tv_sec, ts.tv_nsec);
+#endif
+
+	r = 0;
+
+out:
+#ifdef KEM_TEST_MUTATION
+	free(mutated_ciphertext);
+#endif
+	return r;
 }
 
 static int
@@ -156,6 +243,14 @@ input_userauth_kem_response(int type, u_int32_t seq, struct ssh *ssh)
 	size_t response_len = 0;
 	u_char *response = NULL;
 	int ok = 0, r;
+
+#ifdef KEM_TEST_MUTATION
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) == 0)
+		debug("KEM_RESPONSE_EPOCH:%lld.%09ld",
+		    (long long)ts.tv_sec, ts.tv_nsec);
+#endif
 
 	if (authctxt == NULL || ctx == NULL)
 		fatal_f("missing authentication context");

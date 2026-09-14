@@ -5,6 +5,25 @@ OUT_FILE="${1:-$HOME/.ssh/id_mlkem768}"
 KEM_ALG="${2:-ML-KEM-768}"
 OUT_DIR="$(dirname "$OUT_FILE")"
 TMP_DIR="$(mktemp -d)"
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+OQS_PREFIX="${OQS_PREFIX:-$ROOT_DIR/oqs}"
+
+if [[ ! -f "$OQS_PREFIX/include/oqs/oqs.h" ]]; then
+    echo "[ERR] liboqs headers not found under: $OQS_PREFIX"
+    echo "[HINT] Build the repository-local liboqs first with:"
+    echo "       LIBOQS_BRANCH=0.15.0 bash oqs-scripts/clone_liboqs.sh"
+    echo "       bash oqs-scripts/build_liboqs.sh"
+    exit 1
+fi
+
+if [[ ! -e "$OQS_PREFIX/lib/liboqs.so" ]]; then
+    echo "[ERR] liboqs shared library not found under: $OQS_PREFIX/lib"
+    echo "[HINT] Build the repository-local liboqs first with:"
+    echo "       bash oqs-scripts/build_liboqs.sh"
+    exit 1
+fi
+
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 mkdir -p "$OUT_DIR"
@@ -92,7 +111,13 @@ int main(int argc, char **argv) {
 }
 EOF
 
-cc -O2 -I/usr/local/include "$TMP_DIR/gen_mlkem.c" -L/usr/local/lib -loqs -o "$TMP_DIR/gen_mlkem"
+cc -O2 \
+    -I"$OQS_PREFIX/include" \
+    "$TMP_DIR/gen_mlkem.c" \
+    -L"$OQS_PREFIX/lib" \
+    -Wl,-rpath,"$OQS_PREFIX/lib" \
+    -loqs \
+    -o "$TMP_DIR/gen_mlkem"
 "$TMP_DIR/gen_mlkem" "$TMP_DIR/pk.bin" "$TMP_DIR/sk.bin" "$KEM_ALG"
 
 PUB_B64="$(base64 -w0 "$TMP_DIR/pk.bin")"

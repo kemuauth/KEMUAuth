@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# run — Malformed-ciphertext robustness and decapsulation-timing checks
+#
+# Usage:
+#   sudo bash testScripts/implementation_checks/ciphertext_robustness/run [options]
+#
+# Options:
+#   --mode protocol|local|all     Test mode (default: all)
+#   --same-len-tests <n>          Protocol: same-length tests per class (default: 50)
+#   --diff-len-tests <n>          Protocol: diff-length tests per class (default: 50)
+#   --decaps-warmup <n>           Local: warmup iterations (default: 100)
+#   --decaps-iterations <n>       Local: measurement iterations (default: 500)
+#   --decaps-core <n>             Local: CPU core to pin (default: 0)
+#   --port <n>                    SSH port (default: 42570)
+#   --user <name>                 SSH test user (default: current user)
+#   -h, --help                    Show this help
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+RUNNER="$ROOT_DIR/testScripts/backends/run_ciphertext_robustness.sh"
+RESULT_DIR="$ROOT_DIR/testScripts/implementation_checks/ciphertext_robustness/results"
+WORK_DIR="$ROOT_DIR/testScripts/.work-ciphertext-robustness"
+
+# ---- Defaults ----
+MODE="${MODE:-all}"
+SAME_LEN_TESTS="${SAME_LEN_TESTS:-50}"
+DIFF_LEN_TESTS="${DIFF_LEN_TESTS:-50}"
+DECAPS_WARMUP="${DECAPS_WARMUP:-100}"
+DECAPS_ITERATIONS="${DECAPS_ITERATIONS:-500}"
+DECAPS_CORE="${DECAPS_CORE:-0}"
+TEST_PORT="${TEST_PORT:-42570}"
+TEST_USER="${TEST_USER:-${SUDO_USER:-$(id -un)}}"
+TEST_HOST="${TEST_HOST:-127.0.0.1}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  sudo bash testScripts/implementation_checks/ciphertext_robustness/run [options]
+
+Options:
+  --mode protocol|local|all     Test mode (default: all)
+  --same-len-tests <n>          Same-length tests per class (default: 50)
+  --diff-len-tests <n>          Diff-length tests per class (default: 50)
+  --decaps-warmup <n>           Decaps warmup iterations (default: 100)
+  --decaps-iterations <n>       Decaps measurement iterations (default: 500)
+  --port <n>                    SSH port (default: 42570)
+  --user <name>                 SSH test user (default: current user)
+  -h, --help                    Show help
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode)            MODE="$2"; shift 2 ;;
+            --same-len-tests)  SAME_LEN_TESTS="$2"; shift 2 ;;
+            --diff-len-tests)  DIFF_LEN_TESTS="$2"; shift 2 ;;
+            --decaps-warmup)   DECAPS_WARMUP="$2"; shift 2 ;;
+            --decaps-iterations) DECAPS_ITERATIONS="$2"; shift 2 ;;
+            --decaps-core)     DECAPS_CORE="$2"; shift 2 ;;
+            --port)            TEST_PORT="$2"; shift 2 ;;
+            --user)            TEST_USER="$2"; shift 2 ;;
+            -h|--help)         usage; exit 0 ;;
+            *)                 echo "[ERR] unknown argument: $1"; usage; exit 1 ;;
+        esac
+    done
+}
+
+parse_args "$@"
+
+# ---- Validate ----
+if [[ ! -x "$RUNNER" ]]; then
+    echo "[ERR] missing runner: $RUNNER"
+    exit 1
+fi
+
+if [[ "$MODE" != "protocol" && "$MODE" != "local" && "$MODE" != "all" && "$MODE" != "build" ]]; then
+    echo "[ERR] invalid mode: $MODE (expected: protocol|local|all|build)"
+    exit 1
+fi
+
+# ---- Helpers ----
+us_ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+log_info() { printf '[%s][INFO] %s\n' "$(us_ts)" "$*"; }
+
+mkdir -p "$RESULT_DIR" "$WORK_DIR"
+
+# ---- Dispatch to backend ----
+log_info "Starting ciphertext robustness check (mode=$MODE)"
+
+run_backend() {
+  local backend_mode="$1"
+
+  MODE="$backend_mode" \
+  RESULT_DIR="$RESULT_DIR" \
+  WORK_DIR="$WORK_DIR" \
+  SAME_LEN_TESTS="$SAME_LEN_TESTS" \
+  DIFF_LEN_TESTS="$DIFF_LEN_TESTS" \
+  DECAPS_WARMUP="$DECAPS_WARMUP" \
+  DECAPS_ITERATIONS="$DECAPS_ITERATIONS" \
+  DECAPS_CORE="$DECAPS_CORE" \
+    bash "$RUNNER"
+}
+
+case "$MODE" in
+  protocol)
+    run_backend build
+
+    restore_needed=1
+    trap '
+      if [[ "${restore_needed:-0}" -eq 1 ]]; then
+        MODE=restore \
+        RESULT_DIR="'"$RESULT_DIR"'" \
+        WORK_DIR="'"$WORK_DIR"'" \
+          bash "'"$RUNNER"'" || true
+      fi
+    ' EXIT INT TERM
+
+    run_backend protocol
+    run_backend restore
+    restore_needed=0
+    trap - EXIT INT TERM
+    ;;
+
+  local)
+    run_backend local
+    ;;
+
+  all)
+    run_backend build
+
+    restore_needed=1
+    trap '
+      if [[ "${restore_needed:-0}" -eq 1 ]]; then
+        MODE=restore \
+        RESULT_DIR="'"$RESULT_DIR"'" \
+        WORK_DIR="'"$WORK_DIR"'" \
+          bash "'"$RUNNER"'" || true
+      fi
+    ' EXIT INT TERM
+
+    run_backend protocol
+    run_backend local
+
+    run_backend restore
+    restore_needed=0
+    trap - EXIT INT TERM
+    ;;
+
+  build)
+    run_backend build
+    ;;
+
+  *)
+    echo "[ERR] invalid mode: $MODE"
+    exit 1
+    ;;
+esac
