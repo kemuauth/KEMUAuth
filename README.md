@@ -13,24 +13,22 @@ and evaluation scripts associated with the paper:
 
 ## Repository Status
 
-This branch is the **paper-aligned ICNP 2026 implementation**.
+`main` is the **maintained development branch** of KEMUAuth.
 
-It is intended to preserve the implementation and evaluation environment
-corresponding to the camera-ready paper and the extended arXiv version. The
-experiment organization, published numerical results, and reproduction
-instructions in this branch are maintained to match the published work.
+The cleaned implementation and evaluation environment aligned with the ICNP
+2026 paper and the extended arXiv version is preserved on the
+`paper/icnp-2026` branch and by the `icnp-2026-paper-release` tag. The exact
+original research-artifact snapshot is preserved by the
+`icnp-2026-original-artifact` tag.
 
-Two narrowly scoped post-artifact robustness hardening changes are present in
-this branch: explicit client-side KEM ciphertext-length validation and safer
-test-only malformed-ciphertext mutation instrumentation. These changes do not
-alter the valid KEMUAuth protocol flow. The original ICNP artifact
-implementation is preserved by the tag `icnp-2026-original-artifact`.
+The paper-aligned release includes two narrowly scoped post-artifact robustness
+hardening changes: explicit client-side KEM ciphertext-length validation and
+safer test-only malformed-ciphertext mutation instrumentation. These changes do
+not alter the valid KEMUAuth protocol flow.
 
-Future standards-oriented development may refine protocol details, wire
-formats, algorithm negotiation, implementation structure, and testing
-infrastructure. Such development should take place on the project's main
-development branch rather than modifying the historical paper-aligned behavior
-in this branch.
+Ongoing protocol, standards-oriented, implementation, and testing development
+takes place on `main`. The historical paper branch and release tags are
+preserved as stable reference points.
 
 ## KEMUAuth Overview
 
@@ -390,18 +388,20 @@ the repository.
 
 ## Project and Artifact History
 
-The initial public implementation was released through an anonymous GitHub
-account during the paper-review process.
+The original ICNP 2026 research artifact was released through an anonymous
+GitHub account during the paper-review process and is preserved at:
 
-This repository is the maintained KEMUAuth project repository and preserves the
-historical relationship to that research artifact. The paper-aligned branch
-contains the cleaned and documented version of the implementation corresponding
-to the ICNP 2026 paper, while future protocol and standards-oriented development
-can evolve independently on the main development branch.
+https://github.com/bhivfsadh/KEM-Based-User-Authentication-for-Post-Quantum-SSH
 
-The original anonymous artifact should be treated as a historical snapshot.
-For current project documentation, reproducibility instructions, and future
-development, use this repository.
+That repository is archived as the historical artifact entry point and directs
+visitors to this maintained KEMUAuth project.
+
+Within this repository, the tag `icnp-2026-original-artifact` identifies the
+exact original artifact snapshot. The branch `paper/icnp-2026` contains the
+cleaned and documented paper-aligned implementation, and the tag
+`icnp-2026-paper-release` identifies that public paper release.
+
+Ongoing project and standards-oriented development takes place on `main`.
 
 ## Reproducibility Notes
 
