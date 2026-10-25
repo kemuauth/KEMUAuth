@@ -47,50 +47,158 @@ ssh_kem_trim(char *line)
 		*--end = '\0';
 }
 
-static int
-ssh_kem_has_suffix(const char *name, const char *suffix)
-{
-	size_t name_len, suffix_len;
-
-	if (name == NULL || suffix == NULL)
-		return 0;
-	name_len = strlen(name);
-	suffix_len = strlen(suffix);
-	if (name_len < suffix_len)
-		return 0;
-	return strcasecmp(name + name_len - suffix_len, suffix) == 0;
-}
-
 const char *
 ssh_kem_normalize_name(const char *name)
 {
-	char buf[64];
-	size_t len;
+    if (name == NULL)
+        return NULL;
 
-	if (name == NULL)
-		return NULL;
-	if (strlcpy(buf, name, sizeof(buf)) >= sizeof(buf))
-		return NULL;
-	if (ssh_kem_has_suffix(buf, "-sha256")) {
-		len = strlen(buf) - (sizeof("-sha256") - 1);
-		buf[len] = '\0';
-	}
-	if (strcasecmp(buf, SSH_KEM_ALG_MLKEM512) == 0 ||
-	    strcasecmp(buf, "ML-KEM-512") == 0 ||
-	    strcasecmp(buf, "kyber512") == 0 ||
-	    strcasecmp(buf, "Kyber512") == 0)
-		return SSH_KEM_ALG_MLKEM512;
-	if (strcasecmp(buf, SSH_KEM_DEFAULT_ALG) == 0 ||
-	    strcasecmp(buf, "ML-KEM-768") == 0 ||
-	    strcasecmp(buf, "kyber768") == 0 ||
-	    strcasecmp(buf, "Kyber768") == 0)
-		return SSH_KEM_DEFAULT_ALG;
-	if (strcasecmp(buf, SSH_KEM_ALG_MLKEM1024) == 0 ||
-	    strcasecmp(buf, "ML-KEM-1024") == 0 ||
-	    strcasecmp(buf, "kyber1024") == 0 ||
-	    strcasecmp(buf, "Kyber1024") == 0)
-		return SSH_KEM_ALG_MLKEM1024;
-	return NULL;
+    if (strcmp(name, SSH_KEM_ALG_MLKEM512) == 0)
+        return SSH_KEM_ALG_MLKEM512;
+
+    if (strcmp(name, SSH_KEM_DEFAULT_ALG) == 0)
+        return SSH_KEM_DEFAULT_ALG;
+
+    if (strcmp(name, SSH_KEM_ALG_MLKEM1024) == 0)
+        return SSH_KEM_ALG_MLKEM1024;
+
+    return NULL;
+}
+
+const char *
+ssh_kem_public_key_format(const char *alg)
+{
+    if (alg == NULL)
+        return NULL;
+
+    if (strcmp(alg, SSH_KEM_ALG_MLKEM512) == 0)
+        return SSH_KEM_KEY_FORMAT_MLKEM512;
+
+    if (strcmp(alg, SSH_KEM_DEFAULT_ALG) == 0)
+        return SSH_KEM_KEY_FORMAT_MLKEM768;
+
+    if (strcmp(alg, SSH_KEM_ALG_MLKEM1024) == 0)
+        return SSH_KEM_KEY_FORMAT_MLKEM1024;
+
+    return NULL;
+}
+
+int
+ssh_kem_encode_public_key_blob(const char *alg,
+    const u_char *public_key, size_t public_key_len,
+    struct sshbuf **blobp)
+{
+    struct sshkem *kem = NULL;
+    struct sshbuf *blob = NULL;
+    const char *format;
+    int r = SSH_ERR_INVALID_ARGUMENT;
+
+    if (blobp != NULL)
+        *blobp = NULL;
+
+    if (alg == NULL || public_key == NULL || blobp == NULL)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    format = ssh_kem_public_key_format(alg);
+    if (format == NULL || (kem = ssh_kem_new(alg)) == NULL)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    if (public_key_len != ssh_kem_public_key_len(kem)) {
+        r = SSH_ERR_INVALID_FORMAT;
+        goto out;
+    }
+
+    if ((blob = sshbuf_new()) == NULL) {
+        r = SSH_ERR_ALLOC_FAIL;
+        goto out;
+    }
+
+    if ((r = sshbuf_put_cstring(blob, format)) != 0 ||
+        (r = sshbuf_put_string(blob,
+        public_key, public_key_len)) != 0)
+        goto out;
+
+    *blobp = blob;
+    blob = NULL;
+    r = 0;
+
+out:
+    sshbuf_free(blob);
+    ssh_kem_free(kem);
+    return r;
+}
+
+int
+ssh_kem_decode_public_key_blob(const char *alg,
+    const u_char *blob, size_t blob_len,
+    u_char **public_keyp, size_t *public_key_lenp)
+{
+    struct sshkem *kem = NULL;
+    struct sshbuf *b = NULL;
+    const char *format;
+    const u_char *wire_format = NULL, *wire_key = NULL;
+    u_char *key = NULL;
+    size_t wire_format_len = 0, wire_key_len = 0;
+    size_t expected_len;
+    int r = SSH_ERR_INVALID_FORMAT;
+
+    if (public_keyp != NULL)
+        *public_keyp = NULL;
+    if (public_key_lenp != NULL)
+        *public_key_lenp = 0;
+
+    if (alg == NULL || blob == NULL ||
+        public_keyp == NULL || public_key_lenp == NULL)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    format = ssh_kem_public_key_format(alg);
+    if (format == NULL || (kem = ssh_kem_new(alg)) == NULL)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    /* Two SSH strings: format identifier and raw KEM public key. */
+    expected_len = 8 + strlen(format) +
+        ssh_kem_public_key_len(kem);
+
+    if (blob_len != expected_len)
+        goto out;
+
+    if ((b = sshbuf_from(blob, blob_len)) == NULL) {
+        r = SSH_ERR_ALLOC_FAIL;
+        goto out;
+    }
+
+    if ((r = sshbuf_get_string_direct(b,
+        &wire_format, &wire_format_len)) != 0 ||
+        (r = sshbuf_get_string_direct(b,
+        &wire_key, &wire_key_len)) != 0)
+        goto out;
+
+    /* Require an exact format match and no trailing bytes. */
+    if (wire_format_len != strlen(format) ||
+        memcmp(wire_format, format, wire_format_len) != 0 ||
+        wire_key_len != ssh_kem_public_key_len(kem) ||
+        sshbuf_len(b) != 0) {
+        r = SSH_ERR_INVALID_FORMAT;
+        goto out;
+    }
+
+    if ((key = malloc(wire_key_len)) == NULL) {
+        r = SSH_ERR_ALLOC_FAIL;
+        goto out;
+    }
+
+    memcpy(key, wire_key, wire_key_len);
+
+    *public_keyp = key;
+    *public_key_lenp = wire_key_len;
+    key = NULL;
+    r = 0;
+
+out:
+    free(key);
+    sshbuf_free(b);
+    ssh_kem_free(kem);
+    return r;
 }
 
 int

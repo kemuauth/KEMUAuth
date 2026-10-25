@@ -1,0 +1,12 @@
+
+KEM_BLOB_TEST = tests/protocol/kem-blob-test
+
+.PHONY: kem-blob-test
+
+kem-blob-test: $(KEM_BLOB_TEST)
+	./$(KEM_BLOB_TEST)
+
+$(KEM_BLOB_TEST): tests/protocol/kem_blob_test.c libssh.a $(LIBCOMPAT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< \
+	    $(LDFLAGS) -lssh -lopenbsd-compat \
+	    -lssh -lopenbsd-compat $(LIBS) $(CHANNELLIBS)

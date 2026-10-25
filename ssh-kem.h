@@ -5,13 +5,39 @@
 
 struct sshkem;
 struct ssh_kem_identity;
+struct sshbuf;
 
+/* SSH user authentication method */
 #define SSH_KEM_AUTH_METHOD "publickey-kem"
+
+/* Legacy experimental method; not part of the draft */
 #define SSH_KEM_AND_AUTH_METHOD "publickey-kem-and"
+
+/* Domain separation label */
 #define SSH_KEM_CLIENT_AUTH_LABEL "ssh-publickey-kem-client-auth"
-#define SSH_KEM_DEFAULT_ALG "mlkem768"
-#define SSH_KEM_ALG_MLKEM512 "mlkem512"
-#define SSH_KEM_ALG_MLKEM1024 "mlkem1024"
+
+/* Authentication algorithm profiles */
+#define SSH_KEM_DEFAULT_ALG "ssh-mlkem-768-hmac-sha256"
+#define SSH_KEM_ALG_MLKEM512 "ssh-mlkem-512-hmac-sha256"
+#define SSH_KEM_ALG_MLKEM1024 "ssh-mlkem-1024-hmac-sha256"
+
+/* SSH public key format identifiers */
+#define SSH_KEM_KEY_FORMAT_MLKEM512 "ssh-mlkem-512"
+#define SSH_KEM_KEY_FORMAT_MLKEM768 "ssh-mlkem-768"
+#define SSH_KEM_KEY_FORMAT_MLKEM1024 "ssh-mlkem-1024"
+
+/* Map an authentication profile to its SSH public key format. */
+const char *ssh_kem_public_key_format(const char *alg);
+
+/* Encode a raw KEM public key as an SSH public key blob. */
+int ssh_kem_encode_public_key_blob(const char *alg,
+    const u_char *public_key, size_t public_key_len,
+    struct sshbuf **blobp);
+
+/* Decode and validate the structure of an SSH KEM public key blob. */
+int ssh_kem_decode_public_key_blob(const char *alg,
+    const u_char *blob, size_t blob_len,
+    u_char **public_keyp, size_t *public_key_lenp);
 
 struct sshkem *ssh_kem_new(const char *name);
 void ssh_kem_free(struct sshkem *kem);
