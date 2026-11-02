@@ -49,19 +49,9 @@ struct authmethod_cfg methodcfg_kem = {
 	NULL,
 	&options.kem_authentication
 };
-struct authmethod_cfg methodcfg_kem_and = {
-	"publickey-kem-and",
-	NULL,
-	&options.kem_authentication
-};
 struct authmethod_cfg methodcfg_pubkey = {
 	"publickey",
 	"publickey-hostbound-v00@openssh.com",
-	&options.pubkey_authentication
-};
-struct authmethod_cfg methodcfg_pubkey_hybrid_and = {
-	"publickey-hybrid-and",
-	NULL,
 	&options.pubkey_authentication
 };
 #ifdef GSSAPI
@@ -90,9 +80,7 @@ struct authmethod_cfg methodcfg_hostbased = {
 static struct authmethod_cfg *authmethod_cfgs[] = {
 	&methodcfg_none,
 	&methodcfg_kem,
-	&methodcfg_kem_and,
 	&methodcfg_pubkey,
-	&methodcfg_pubkey_hybrid_and,
 #ifdef GSSAPI
 	&methodcfg_gssapi,
 #endif

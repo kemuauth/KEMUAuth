@@ -417,19 +417,6 @@ out:
 	return ret;
 }
 
-char *
-ssh_kem_first_alg(const char *names)
-{
-	char *ret, *cp;
-
-	if (!ssh_kem_names_valid(names))
-		return NULL;
-	ret = xstrdup(names);
-	if ((cp = strchr(ret, ',')) != NULL)
-		*cp = '\0';
-	return ret;
-}
-
 int
 ssh_kem_b64_encode(const u_char *data, size_t len, char **out)
 {
@@ -597,63 +584,6 @@ ssh_kem_identity_secret_key(const struct ssh_kem_identity *identity,
 	if (lenp != NULL)
 		*lenp = identity != NULL ? identity->secret_key_len : 0;
 	return identity != NULL ? identity->secret_key : NULL;
-}
-
-int
-ssh_kem_derive_response(struct ssh *ssh, const char *user,
-	const char *service, const char *method, const char *alg,
-    const u_char *public_key,
-    size_t public_key_len, const u_char *ciphertext, size_t ciphertext_len,
-    const u_char *shared_secret, size_t shared_secret_len, u_char *response,
-    size_t response_len)
-{
-	struct sshbuf *context = NULL;
-	struct ssh_hmac_ctx *hmac = NULL;
-	size_t digest_len;
-	int digest_alg;
-	int r = SSH_ERR_INTERNAL_ERROR;
-
-	if (ssh == NULL || ssh->kex == NULL || ssh->kex->session_id == NULL ||
-	    user == NULL || service == NULL || method == NULL || alg == NULL ||
-	    public_key == NULL ||
-	    ciphertext == NULL || shared_secret == NULL || response == NULL)
-		return SSH_ERR_INVALID_ARGUMENT;
-	if ((digest_alg = ssh_kem_response_digest(alg)) == -1)
-		return SSH_ERR_INVALID_ARGUMENT;
-	digest_len = ssh_hmac_bytes(digest_alg);
-	if (response_len < digest_len)
-		return SSH_ERR_INVALID_ARGUMENT;
-	if ((context = sshbuf_new()) == NULL)
-		return SSH_ERR_ALLOC_FAIL;
-	if ((r = sshbuf_put_u8(context, SSH2_MSG_USERAUTH_REQUEST)) != 0 ||
-	    (r = sshbuf_put_cstring(context, user)) != 0 ||
-	    (r = sshbuf_put_cstring(context, service)) != 0 ||
-	    (r = sshbuf_put_cstring(context, method)) != 0 ||
-	    (r = sshbuf_put_cstring(context, alg)) != 0 ||
-	    (r = sshbuf_put_string(context, public_key, public_key_len)) != 0 ||
-	    (r = sshbuf_put_u8(context, SSH2_MSG_USERAUTH_KEM_CHALLENGE)) != 0 ||
-	    (r = sshbuf_put_cstring(context, alg)) != 0 ||
-	    (r = sshbuf_put_string(context, public_key, public_key_len)) != 0 ||
-	    (r = sshbuf_put_string(context, ciphertext, ciphertext_len)) != 0)
-		goto out;
-	if ((hmac = ssh_hmac_start(digest_alg)) == NULL) {
-		r = SSH_ERR_ALLOC_FAIL;
-		goto out;
-	}
-	if ((r = ssh_hmac_init(hmac, shared_secret, shared_secret_len)) != 0 ||
-	    (r = ssh_hmac_update(hmac, SSH_KEM_CLIENT_AUTH_LABEL,
-	    sizeof(SSH_KEM_CLIENT_AUTH_LABEL) - 1)) != 0 ||
-	    (r = ssh_hmac_update(hmac, sshbuf_ptr(ssh->kex->session_id),
-	    sshbuf_len(ssh->kex->session_id))) != 0 ||
-	    (r = ssh_hmac_update_buffer(hmac, context)) != 0 ||
-	    (r = ssh_hmac_final(hmac, response,
-	    digest_len)) != 0)
-		goto out;
-	r = 0;
-out:
-	ssh_hmac_free(hmac);
-	sshbuf_free(context);
-	return r;
 }
 
 int

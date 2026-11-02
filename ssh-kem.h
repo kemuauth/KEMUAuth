@@ -10,9 +10,6 @@ struct sshbuf;
 /* SSH user authentication method */
 #define SSH_KEM_AUTH_METHOD "publickey-kem"
 
-/* Legacy experimental method; not part of the draft */
-#define SSH_KEM_AND_AUTH_METHOD "publickey-kem-and"
-
 /* Domain separation label */
 #define SSH_KEM_CLIENT_AUTH_LABEL "ssh-publickey-kem-client-auth"
 
@@ -61,7 +58,6 @@ int ssh_kem_response_digest(const char *name);
 size_t ssh_kem_response_len(const char *name);
 int ssh_kem_names_valid(const char *names);
 int ssh_kem_name_permitted(const char *allowlist, const char *name);
-char *ssh_kem_first_alg(const char *names);
 int ssh_kem_b64_encode(const u_char *data, size_t len, char **out);
 int ssh_kem_b64_decode(const char *input, u_char **data, size_t *len);
 int ssh_kem_load_identity(const char *path, struct ssh_kem_identity **idp);
@@ -71,12 +67,6 @@ const u_char *ssh_kem_identity_public_key(const struct ssh_kem_identity *identit
     size_t *lenp);
 const u_char *ssh_kem_identity_secret_key(const struct ssh_kem_identity *identity,
     size_t *lenp);
-int ssh_kem_derive_response(struct ssh *ssh, const char *user,
-    const char *service, const char *method, const char *alg,
-    const u_char *public_key,
-    size_t public_key_len, const u_char *ciphertext, size_t ciphertext_len,
-    const u_char *shared_secret, size_t shared_secret_len, u_char *response,
-    size_t response_len);
 
 /* Build the exact MAC_input defined by the publickey-kem draft. */
 int ssh_kem_build_mac_input(const u_char *sid, size_t sid_len,

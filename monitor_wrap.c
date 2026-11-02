@@ -559,6 +559,30 @@ mm_auth_kem_respond(const u_char *response, size_t response_len,
 	return 0;
 }
 
+void
+mm_auth_kem_cancel(void)
+{
+	struct sshbuf *m;
+
+	if ((m = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+
+	/*
+	 * Cancel the outstanding KEM challenge and wait until
+	 * the privileged monitor has discarded its state.
+	 */
+	mm_request_send(pmonitor->m_recvfd,
+	    MONITOR_REQ_KEM_CANCEL, m);
+
+	mm_request_receive_expect(pmonitor->m_recvfd,
+	    MONITOR_ANS_KEM_CANCEL, m);
+
+	if (sshbuf_len(m) != 0)
+		fatal_f("invalid KEM cancel reply");
+
+	sshbuf_free(m);
+}
+
 int
 mm_user_key_allowed(struct ssh *ssh, struct passwd *pw, struct sshkey *key,
     int pubkey_auth_attempt, struct sshauthopt **authoptp)

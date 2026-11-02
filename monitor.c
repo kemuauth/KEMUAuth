@@ -128,6 +128,7 @@ int mm_answer_keyallowed(struct ssh *, int, struct sshbuf *);
 int mm_answer_keyverify(struct ssh *, int, struct sshbuf *);
 int mm_answer_kem_init(struct ssh *, int, struct sshbuf *);
 int mm_answer_kem_resp(struct ssh *, int, struct sshbuf *);
+int mm_answer_kem_cancel(struct ssh *, int, struct sshbuf *);
 int mm_answer_pty(struct ssh *, int, struct sshbuf *);
 int mm_answer_pty_cleanup(struct ssh *, int, struct sshbuf *);
 int mm_answer_term(struct ssh *, int, struct sshbuf *);
@@ -169,6 +170,9 @@ static u_char *kem_expected_response = NULL;
 static size_t kem_expected_response_len = 0;
 static char *kem_alg = NULL;
 static char *kem_method = NULL;
+/* Raw encapsulation key retained only until response or cancellation. */
+static u_char *kem_pending_public_key = NULL;
+static size_t kem_pending_public_key_len = 0;
 static u_int session_id2_len = 0;
 static u_char *session_id2 = NULL;
 static pid_t monitor_child_pid;
@@ -222,6 +226,7 @@ struct mon_table mon_dispatch_proto20[] = {
     {MONITOR_REQ_KEYVERIFY, MON_AUTH, mm_answer_keyverify},
 	{MONITOR_REQ_KEM_INIT, MON_ISAUTH, mm_answer_kem_init},
 	{MONITOR_REQ_KEM_RESP, MON_AUTH, mm_answer_kem_resp},
+	{MONITOR_REQ_KEM_CANCEL, MON_ISAUTH, mm_answer_kem_cancel},
 #ifdef GSSAPI
     {MONITOR_REQ_GSSSETUP, MON_ISAUTH, mm_answer_gss_setup_ctx},
     {MONITOR_REQ_GSSSTEP, 0, mm_answer_gss_accept_ctx},
@@ -587,6 +592,30 @@ monitor_allowed_key(const u_char *blob, u_int bloblen)
 	return (1);
 }
 
+/* Consume one challenge without discarding the authentication result. */
+static void
+monitor_consume_kem_challenge(void)
+{
+	freezero(kem_expected_response, kem_expected_response_len);
+	kem_expected_response = NULL;
+	kem_expected_response_len = 0;
+
+	free(kem_pending_public_key);
+	kem_pending_public_key = NULL;
+	kem_pending_public_key_len = 0;
+}
+
+static void
+monitor_reset_kem_pending(void)
+{
+	monitor_consume_kem_challenge();
+
+	free(kem_alg);
+	kem_alg = NULL;
+	free(kem_method);
+	kem_method = NULL;
+}
+
 static void
 monitor_reset_key_state(void)
 {
@@ -601,13 +630,35 @@ monitor_reset_key_state(void)
 	key_opts = NULL;
 	hostbased_cuser = NULL;
 	hostbased_chost = NULL;
-	freezero(kem_expected_response, kem_expected_response_len);
-	kem_expected_response = NULL;
-	kem_expected_response_len = 0;
-	free(kem_alg);
-	kem_alg = NULL;
-	free(kem_method);
-	kem_method = NULL;
+	monitor_reset_kem_pending();
+}
+
+int
+mm_answer_kem_cancel(struct ssh *ssh, int sock, struct sshbuf *m)
+{
+	struct sshbuf *reply;
+
+	/* Cancel requests do not carry a payload. */
+	if (sshbuf_len(m) != 0)
+		fatal_f("invalid KEM cancel request");
+
+	/*
+	 * Only discard an outstanding challenge.
+	 * Do not release authentication-result state after
+	 * the response has already been consumed.
+	 */
+	if (kem_expected_response != NULL) {
+		debug_f("cancelling outstanding KEM challenge");
+		monitor_reset_kem_pending();
+	}
+
+	if ((reply = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+
+	mm_request_send(sock, MONITOR_ANS_KEM_CANCEL, reply);
+	sshbuf_free(reply);
+
+	return 0;
 }
 
 static int
@@ -704,60 +755,6 @@ kem_key_allowed(struct passwd *pw, const char *alg,
 	return success;
 }
 
-static int
-kem_derive_response_monitor(const char *user, const char *service,
-	const char *method, const char *alg,
-    const u_char *public_key, size_t public_key_len,
-    const u_char *ciphertext, size_t ciphertext_len,
-    const u_char *shared_secret, size_t shared_secret_len,
-    u_char *response, size_t response_len)
-{
-	struct sshbuf *context = NULL;
-	struct ssh_hmac_ctx *hmac = NULL;
-	int digest_alg;
-	int r = SSH_ERR_INTERNAL_ERROR;
-
-	if (session_id2 == NULL || session_id2_len == 0 || user == NULL ||
-	    service == NULL || method == NULL || alg == NULL ||
-	    public_key == NULL ||
-	    ciphertext == NULL || shared_secret == NULL || response == NULL)
-		return SSH_ERR_INVALID_ARGUMENT;
-	if ((digest_alg = ssh_kem_response_digest(alg)) == -1)
-		return SSH_ERR_INVALID_ARGUMENT;
-	if (response_len < ssh_hmac_bytes(digest_alg))
-		return SSH_ERR_INVALID_ARGUMENT;
-	if ((context = sshbuf_new()) == NULL)
-		return SSH_ERR_ALLOC_FAIL;
-	if ((r = sshbuf_put_u8(context, SSH2_MSG_USERAUTH_REQUEST)) != 0 ||
-	    (r = sshbuf_put_cstring(context, user)) != 0 ||
-	    (r = sshbuf_put_cstring(context, service)) != 0 ||
-	    (r = sshbuf_put_cstring(context, method)) != 0 ||
-	    (r = sshbuf_put_cstring(context, alg)) != 0 ||
-	    (r = sshbuf_put_string(context, public_key, public_key_len)) != 0 ||
-	    (r = sshbuf_put_u8(context, SSH2_MSG_USERAUTH_KEM_CHALLENGE)) != 0 ||
-	    (r = sshbuf_put_cstring(context, alg)) != 0 ||
-	    (r = sshbuf_put_string(context, public_key, public_key_len)) != 0 ||
-	    (r = sshbuf_put_string(context, ciphertext, ciphertext_len)) != 0)
-		goto out;
-	if ((hmac = ssh_hmac_start(digest_alg)) == NULL) {
-		r = SSH_ERR_ALLOC_FAIL;
-		goto out;
-	}
-	if ((r = ssh_hmac_init(hmac, shared_secret, shared_secret_len)) != 0 ||
-	    (r = ssh_hmac_update(hmac, SSH_KEM_CLIENT_AUTH_LABEL,
-	    sizeof(SSH_KEM_CLIENT_AUTH_LABEL) - 1)) != 0 ||
-	    (r = ssh_hmac_update(hmac, session_id2, session_id2_len)) != 0 ||
-	    (r = ssh_hmac_update_buffer(hmac, context)) != 0 ||
-	    (r = ssh_hmac_final(hmac, response,
-	    ssh_hmac_bytes(digest_alg))) != 0)
-		goto out;
-	r = 0;
-out:
-	ssh_hmac_free(hmac);
-	sshbuf_free(context);
-	return r;
-}
-
 int
 mm_answer_kem_init(struct ssh *ssh, int sock, struct sshbuf *m)
 {
@@ -769,7 +766,7 @@ mm_answer_kem_init(struct ssh *ssh, int sock, struct sshbuf *m)
 	u_char *expected = NULL;
 	size_t public_key_len = 0, ciphertext_len = 0, shared_secret_len = 0;
 	size_t decoded_public_key_len = 0, kem_public_key_len = 0;
-	char *method = NULL, *alg = NULL;
+	char *method = NULL, *alg = NULL, *userstyle = NULL;
 	u_int allowed = 0;
 	int r;
 
@@ -788,27 +785,14 @@ mm_answer_kem_init(struct ssh *ssh, int sock, struct sshbuf *m)
 	* The draft method carries an SSH public key blob.
 	* Decode it before authorization and KEM encapsulation.
 	*/
-	if (strcmp(method, SSH_KEM_AUTH_METHOD) == 0) {
-		if (ssh_kem_decode_public_key_blob(
-			alg, public_key, public_key_len,
-			&decoded_public_key, &decoded_public_key_len) != 0)
-			goto out;
-			
-		if (ssh_kem_validate_public_key(alg,
-			decoded_public_key, decoded_public_key_len) != 0)
-			goto out;
-
-		kem_public_key = decoded_public_key;
-		kem_public_key_len = decoded_public_key_len;
-	} else if (strcmp(method, SSH_KEM_AND_AUTH_METHOD) == 0) {
-		/*
-		* Legacy experimental method still carries a raw key.
-		*/
-		kem_public_key = public_key;
-		kem_public_key_len = public_key_len;
-	} else {
+	if (strcmp(method, SSH_KEM_AUTH_METHOD) != 0 ||
+	    ssh_kem_decode_public_key_blob(alg, public_key, public_key_len,
+	    &decoded_public_key, &decoded_public_key_len) != 0 ||
+	    ssh_kem_validate_public_key(alg, decoded_public_key,
+	    decoded_public_key_len) != 0)
 		goto out;
-	}
+	kem_public_key = decoded_public_key;
+	kem_public_key_len = decoded_public_key_len;
 
 	if (!options.kem_authentication || !authctxt->valid ||
 	    !ssh_kem_name_permitted(options.kem_auth_algorithms, alg) ||
@@ -829,6 +813,11 @@ mm_answer_kem_init(struct ssh *ssh, int sock, struct sshbuf *m)
 	}
 	expected = xcalloc(kem_expected_response_len, sizeof(*expected));
 	
+	/* Match the on-wire username, including the optional :style. */
+	xasprintf(&userstyle, "%s%s%s", authctxt->user,
+	    authctxt->style != NULL ? ":" : "",
+	    authctxt->style != NULL ? authctxt->style : "");
+
 	/* Encapsulate to the decoded raw ML-KEM public key. */
 	if ((r = ssh_kem_encaps(kem, ciphertext,
 		shared_secret, kem_public_key)) != 0)
@@ -838,27 +827,21 @@ mm_answer_kem_init(struct ssh *ssh, int sock, struct sshbuf *m)
 	* The draft method uses the same confirmation computation
 	* as the client, with the exact SSH public key blob.
 	*/
-	if (strcmp(method, SSH_KEM_AUTH_METHOD) == 0) {
-		r = ssh_kem_compute_confirmation(
-			session_id2, session_id2_len,
-			authctxt->user, authctxt->service, alg,
-			public_key, public_key_len,
-			ciphertext, ciphertext_len,
-			shared_secret, shared_secret_len,
-			expected, kem_expected_response_len);
-	} else {
-		/* Preserve the legacy experimental computation. */
-		r = kem_derive_response_monitor(
-			authctxt->user, authctxt->service,
-			method, alg,
-			kem_public_key, kem_public_key_len,
-			ciphertext, ciphertext_len,
-			shared_secret, shared_secret_len,
-			expected, kem_expected_response_len);
-	}
+	r = ssh_kem_compute_confirmation(
+	    session_id2, session_id2_len,
+	    userstyle, authctxt->service, alg,
+	    public_key, public_key_len,
+	    ciphertext, ciphertext_len,
+	    shared_secret, shared_secret_len,
+	    expected, kem_expected_response_len);
 
 	if (r != 0)
 		goto out;
+
+	/* Preserve the authorized raw key for the final authorization check. */
+	kem_pending_public_key = xmalloc(kem_public_key_len);
+	memcpy(kem_pending_public_key, kem_public_key, kem_public_key_len);
+	kem_pending_public_key_len = kem_public_key_len;
 
 	kem_expected_response = expected;
 	expected = NULL;
@@ -878,6 +861,7 @@ out:
 	ssh_kem_free(kem);
 	free(method);
 	free(alg);
+	free(userstyle);
 	free(public_key);
 	free(decoded_public_key);
 	free(ciphertext);
@@ -906,22 +890,30 @@ mm_answer_kem_resp(struct ssh *ssh, int sock, struct sshbuf *m)
 	if (sshbuf_len(m) != 0)
 		fatal_f("invalid KEM response request");
 
+	/* Both the key and the authorization must still be valid now. */
 	if (kem_expected_response != NULL && kem_method != NULL &&
+	    kem_alg != NULL && kem_pending_public_key != NULL &&
 	    strcmp(method, kem_method) == 0 &&
+	    authctxt->valid && authctxt->pw != NULL &&
+	    options.kem_authentication &&
+	    ssh_kem_name_permitted(options.kem_auth_algorithms, kem_alg) &&
+	    auth2_method_allowed(authctxt, kem_method, kem_alg) &&
+	    kem_key_allowed(authctxt->pw, kem_alg,
+	    kem_pending_public_key, kem_pending_public_key_len) &&
 	    kem_ct_memeq(response, response_len, kem_expected_response,
 	    kem_expected_response_len)) {
 		authenticated = 1;
 		auth_method = kem_method;
 		auth_submethod = kem_alg;
-		auth2_record_info(authctxt, "kem algorithm %s",
-		    kem_alg != NULL ? kem_alg : method);
+		auth2_record_info(authctxt, "kem algorithm %s", kem_alg);
 	}
-	freezero(kem_expected_response, kem_expected_response_len);
-	kem_expected_response = NULL;
-	kem_expected_response_len = 0;
-	if (!authenticated) {
-		free(kem_alg);
-		kem_alg = NULL;
+
+	/* One-time challenge: never accept a second response for it. */
+	if (authenticated) {
+		/* Retain method and algorithm for OpenSSH auth logging/MFA. */
+		monitor_consume_kem_challenge();
+	} else {
+		monitor_reset_kem_pending();
 		auth_submethod = NULL;
 	}
 
@@ -1719,7 +1711,6 @@ monitor_valid_userblob(struct ssh *ssh, const u_char *data, u_int datalen)
 	size_t len;
 	u_char type;
 	int hostbound = 0, r, fail = 0;
-	int kem_and = 0;
 
 	if ((b = sshbuf_from(data, datalen)) == NULL)
 		fatal_f("sshbuf_from");
@@ -1760,15 +1751,11 @@ monitor_valid_userblob(struct ssh *ssh, const u_char *data, u_int datalen)
 	if ((r = sshbuf_skip_string(b)) != 0 ||	/* service */
 	    (r = sshbuf_get_cstring(b, &cp, NULL)) != 0)
 		fatal_fr(r, "parse method");
-	if (strcmp("publickey", cp) != 0 &&
-	    strcmp("publickey-hybrid-and", cp) != 0 &&
-	    strcmp("publickey-kem-and", cp) != 0) {
+	if (strcmp("publickey", cp) != 0) {
 		if (strcmp("publickey-hostbound-v00@openssh.com", cp) == 0)
 			hostbound = 1;
 		else
 			fail++;
-	} else if (strcmp("publickey-kem-and", cp) == 0) {
-		kem_and = 1;
 	}
 	free(cp);
 	if ((r = sshbuf_get_u8(b, &type)) != 0)
@@ -1777,8 +1764,6 @@ monitor_valid_userblob(struct ssh *ssh, const u_char *data, u_int datalen)
 		fail++;
 	if ((r = sshbuf_skip_string(b)) != 0 ||	/* pkalg */
 	    (r = sshbuf_skip_string(b)) != 0 ||	/* pkblob */
-	    (kem_and && (r = sshbuf_skip_string(b)) != 0) ||	/* kem alg */
-	    (kem_and && (r = sshbuf_skip_string(b)) != 0) ||	/* kem pk */
 	    (hostbound && (r = sshkey_froms(b, &hostkey)) != 0))
 		fatal_fr(r, "parse pk");
 	if (sshbuf_len(b) != 0)

@@ -64,6 +64,7 @@ int mm_sshkey_verify(const struct sshkey *, const u_char *, size_t,
 int mm_auth_kem_init(const char *, const char *, const u_char *, size_t,
     u_char **, size_t *);
 int mm_auth_kem_respond(const u_char *, size_t, const char *, int *);
+void mm_auth_kem_cancel(void);
 
 void mm_decode_activate_server_options(struct ssh *ssh, struct sshbuf *m);
 
