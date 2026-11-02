@@ -611,18 +611,16 @@ monitor_reset_key_state(void)
 }
 
 static int
-kem_ct_memeq(const u_char *left, size_t left_len, const u_char *right,
-    size_t right_len)
+kem_ct_memeq(const u_char *left, size_t left_len,
+    const u_char *right, size_t right_len)
 {
-	size_t i, max = left_len > right_len ? left_len : right_len;
-	u_char diff = (u_char)(left_len ^ right_len);
+    if (left == NULL || right == NULL)
+        return 0;
 
-	for (i = 0; i < max; i++) {
-		u_char l = i < left_len ? left[i] : 0;
-		u_char r = i < right_len ? right[i] : 0;
-		diff |= l ^ r;
-	}
-	return diff == 0;
+    if (left_len != right_len)
+        return 0;
+
+    return timingsafe_bcmp(left, right, left_len) == 0;
 }
 
 static int

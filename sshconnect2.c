@@ -1155,6 +1155,7 @@ userauth_kem(struct ssh *ssh)
 	const u_char *public_key, *secret_key;
 	size_t public_key_len, secret_key_len;
 	char *alg = NULL;
+	const char *identity_alg;
 	int r;
 
 	if (authctxt->attempt_kem++ > 0)
@@ -1169,7 +1170,17 @@ userauth_kem(struct ssh *ssh)
 		free(ctx);
 		return 0;
 	}
-	alg = ssh_kem_first_alg(options.kem_auth_algorithms);
+	
+	/*
+	* Select the authentication profile associated with the
+	* loaded identity, subject to the configured allowlist.
+	*/
+	identity_alg = ssh_kem_identity_alg(ctx->identity);
+	if (identity_alg != NULL &&
+		ssh_kem_name_permitted(options.kem_auth_algorithms,
+		identity_alg))
+		alg = xstrdup(identity_alg);
+
 	public_key = ssh_kem_identity_public_key(ctx->identity, &public_key_len);
 	secret_key = ssh_kem_identity_secret_key(ctx->identity, &secret_key_len);
 	if (alg == NULL || public_key == NULL || secret_key == NULL ||
