@@ -83,9 +83,4 @@ int ssh_kem_compute_confirmation(const u_char *sid, size_t sid_len,
     const u_char *shared_secret, size_t shared_secret_len,
     u_char *ca, size_t ca_len);
 
-#ifdef KEM_TEST_INSTRUMENTATION
-void kem_test_inc_pending(void);
-void kem_test_dec_pending(void);
-#endif
-
 #endif

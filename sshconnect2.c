@@ -825,19 +825,6 @@ input_userauth_pk_ok(int type, u_int32_t seq, struct ssh *ssh)
 	}
 	ident = format_identity(id);
 	debug("Server accepts key: %s", ident);
-#ifdef KEM_TEST_INSTRUMENTATION
-	{
-		const char *delay_str = getenv("SIGAUTH_RESPONSE_DELAY_MS");
-		if (delay_str != NULL) {
-			long delay_ms = strtol(delay_str, NULL, 10);
-			if (delay_ms > 0 && delay_ms <= 300000) {
-				fprintf(stderr, "BASELINE_PAUSE_INC\n");
-				usleep((unsigned int)(delay_ms * 1000));
-				fprintf(stderr, "BASELINE_PAUSE_DEC\n");
-			}
-		}
-	}
-#endif
 	sent = sign_and_send_pubkey(ssh, id);
 	r = 0;
  done:
@@ -1252,16 +1239,6 @@ input_userauth_kem_info_req(int type, u_int32_t seq, struct ssh *ssh)
 	    (r = sshpkt_get_string(ssh, &ciphertext, &ciphertext_len)) != 0 ||
 	    (r = sshpkt_get_end(ssh)) != 0)
 		goto out;
-#ifdef KEM_TEST_INSTRUMENTATION
-	{
-		const char *delay_str = getenv("KEMUAUTH_RESPONSE_DELAY_MS");
-		if (delay_str != NULL) {
-			long delay_ms = strtol(delay_str, NULL, 10);
-			if (delay_ms > 0 && delay_ms <= 300000)
-				usleep((unsigned int)(delay_ms * 1000));
-		}
-	}
-#endif
 	public_key = ssh_kem_identity_public_key(ctx->identity,
 		&public_key_len);
 	if (public_key == NULL) {

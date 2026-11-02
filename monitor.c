@@ -890,6 +890,10 @@ mm_answer_kem_resp(struct ssh *ssh, int sock, struct sshbuf *m)
 	if (sshbuf_len(m) != 0)
 		fatal_f("invalid KEM response request");
 
+	/* Attribute rejected confirmations to the KEM authentication method. */
+	auth_method = "publickey-kem";
+	auth_submethod = NULL;
+
 	/* Both the key and the authorization must still be valid now. */
 	if (kem_expected_response != NULL && kem_method != NULL &&
 	    kem_alg != NULL && kem_pending_public_key != NULL &&

@@ -26,15 +26,26 @@ $(KEM_MAC_TEST): tests/protocol/kem_mac_test.c libssh.a $(LIBCOMPAT)
 	    $(LDFLAGS) -lssh -lopenbsd-compat \
 	    -lssh -lopenbsd-compat $(LIBS) $(CHANNELLIBS)
 
-# Real ML-KEM-768 draft vector cross-check
-
+# Real ML-KEM-768 draft vector cross-check. The binary inputs are ignored
+# by Git, so create them automatically before comparing against the fixed JSON.
 KEM_REAL_TEST = tests/protocol/vector-work/kem-real-vector-check
+KEM_VECTOR_GEN = tests/protocol/vector-work/gen_mlkem768_vector
 
-.PHONY: kem-real-vector-check
+.PHONY: kem-real-vector-check kem-vector-regenerate
 
-kem-real-vector-check: $(KEM_REAL_TEST)
+kem-real-vector-check: $(KEM_REAL_TEST) $(KEM_VECTOR_GEN)
+	./$(KEM_VECTOR_GEN)
 	./$(KEM_REAL_TEST)
 	python3 tests/protocol/verify_real_vector.py
+
+kem-vector-regenerate: $(KEM_VECTOR_GEN)
+	./$(KEM_VECTOR_GEN)
+	python3 tests/protocol/generate_draft_vector.py
+
+$(KEM_VECTOR_GEN): tests/protocol/gen_mlkem768_vector.c
+	@mkdir -p tests/protocol/vector-work
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< \
+	    $(LDFLAGS) $(LIBS) $(CHANNELLIBS)
 
 $(KEM_REAL_TEST): tests/protocol/check_real_vector.c libssh.a $(LIBCOMPAT)
 	@mkdir -p tests/protocol/vector-work

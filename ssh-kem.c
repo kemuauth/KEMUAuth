@@ -703,17 +703,3 @@ out:
     sshbuf_free(mac_input);
     return r;
 }
-
-#ifdef KEM_TEST_INSTRUMENTATION
-void
-kem_test_inc_pending(void)
-{
-	debug("KEM_PENDING_INC");
-}
-
-void
-kem_test_dec_pending(void)
-{
-	debug("KEM_PENDING_DEC");
-}
-#endif
