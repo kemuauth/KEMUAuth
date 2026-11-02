@@ -47,50 +47,207 @@ ssh_kem_trim(char *line)
 		*--end = '\0';
 }
 
-static int
-ssh_kem_has_suffix(const char *name, const char *suffix)
-{
-	size_t name_len, suffix_len;
-
-	if (name == NULL || suffix == NULL)
-		return 0;
-	name_len = strlen(name);
-	suffix_len = strlen(suffix);
-	if (name_len < suffix_len)
-		return 0;
-	return strcasecmp(name + name_len - suffix_len, suffix) == 0;
-}
-
 const char *
 ssh_kem_normalize_name(const char *name)
 {
-	char buf[64];
-	size_t len;
+    if (name == NULL)
+        return NULL;
 
-	if (name == NULL)
-		return NULL;
-	if (strlcpy(buf, name, sizeof(buf)) >= sizeof(buf))
-		return NULL;
-	if (ssh_kem_has_suffix(buf, "-sha256")) {
-		len = strlen(buf) - (sizeof("-sha256") - 1);
-		buf[len] = '\0';
+    if (strcmp(name, SSH_KEM_ALG_MLKEM512) == 0)
+        return SSH_KEM_ALG_MLKEM512;
+
+    if (strcmp(name, SSH_KEM_DEFAULT_ALG) == 0)
+        return SSH_KEM_DEFAULT_ALG;
+
+    if (strcmp(name, SSH_KEM_ALG_MLKEM1024) == 0)
+        return SSH_KEM_ALG_MLKEM1024;
+
+    return NULL;
+}
+
+const char *
+ssh_kem_public_key_format(const char *alg)
+{
+    if (alg == NULL)
+        return NULL;
+
+    if (strcmp(alg, SSH_KEM_ALG_MLKEM512) == 0)
+        return SSH_KEM_KEY_FORMAT_MLKEM512;
+
+    if (strcmp(alg, SSH_KEM_DEFAULT_ALG) == 0)
+        return SSH_KEM_KEY_FORMAT_MLKEM768;
+
+    if (strcmp(alg, SSH_KEM_ALG_MLKEM1024) == 0)
+        return SSH_KEM_KEY_FORMAT_MLKEM1024;
+
+    return NULL;
+}
+
+int
+ssh_kem_encode_public_key_blob(const char *alg,
+    const u_char *public_key, size_t public_key_len,
+    struct sshbuf **blobp)
+{
+    struct sshkem *kem = NULL;
+    struct sshbuf *blob = NULL;
+    const char *format;
+    int r = SSH_ERR_INVALID_ARGUMENT;
+
+    if (blobp != NULL)
+        *blobp = NULL;
+
+    if (alg == NULL || public_key == NULL || blobp == NULL)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    format = ssh_kem_public_key_format(alg);
+    if (format == NULL || (kem = ssh_kem_new(alg)) == NULL)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    if (public_key_len != ssh_kem_public_key_len(kem)) {
+        r = SSH_ERR_INVALID_FORMAT;
+        goto out;
+    }
+
+    if ((blob = sshbuf_new()) == NULL) {
+        r = SSH_ERR_ALLOC_FAIL;
+        goto out;
+    }
+
+    if ((r = sshbuf_put_cstring(blob, format)) != 0 ||
+        (r = sshbuf_put_string(blob,
+        public_key, public_key_len)) != 0)
+        goto out;
+
+    *blobp = blob;
+    blob = NULL;
+    r = 0;
+
+out:
+    sshbuf_free(blob);
+    ssh_kem_free(kem);
+    return r;
+}
+
+int
+ssh_kem_decode_public_key_blob(const char *alg,
+    const u_char *blob, size_t blob_len,
+    u_char **public_keyp, size_t *public_key_lenp)
+{
+    struct sshkem *kem = NULL;
+    struct sshbuf *b = NULL;
+    const char *format;
+    const u_char *wire_format = NULL, *wire_key = NULL;
+    u_char *key = NULL;
+    size_t wire_format_len = 0, wire_key_len = 0;
+    size_t expected_len;
+    int r = SSH_ERR_INVALID_FORMAT;
+
+    if (public_keyp != NULL)
+        *public_keyp = NULL;
+    if (public_key_lenp != NULL)
+        *public_key_lenp = 0;
+
+    if (alg == NULL || blob == NULL ||
+        public_keyp == NULL || public_key_lenp == NULL)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    format = ssh_kem_public_key_format(alg);
+    if (format == NULL || (kem = ssh_kem_new(alg)) == NULL)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    /* Two SSH strings: format identifier and raw KEM public key. */
+    expected_len = 8 + strlen(format) +
+        ssh_kem_public_key_len(kem);
+
+    if (blob_len != expected_len)
+        goto out;
+
+    if ((b = sshbuf_from(blob, blob_len)) == NULL) {
+        r = SSH_ERR_ALLOC_FAIL;
+        goto out;
+    }
+
+    if ((r = sshbuf_get_string_direct(b,
+        &wire_format, &wire_format_len)) != 0 ||
+        (r = sshbuf_get_string_direct(b,
+        &wire_key, &wire_key_len)) != 0)
+        goto out;
+
+    /* Require an exact format match and no trailing bytes. */
+    if (wire_format_len != strlen(format) ||
+        memcmp(wire_format, format, wire_format_len) != 0 ||
+        wire_key_len != ssh_kem_public_key_len(kem) ||
+        sshbuf_len(b) != 0) {
+        r = SSH_ERR_INVALID_FORMAT;
+        goto out;
+    }
+
+    if ((key = malloc(wire_key_len)) == NULL) {
+        r = SSH_ERR_ALLOC_FAIL;
+        goto out;
+    }
+
+    memcpy(key, wire_key, wire_key_len);
+
+    *public_keyp = key;
+    *public_key_lenp = wire_key_len;
+    key = NULL;
+    r = 0;
+
+out:
+    free(key);
+    sshbuf_free(b);
+    ssh_kem_free(kem);
+    return r;
+}
+
+int
+ssh_kem_validate_public_key(const char *alg,
+    const u_char *public_key, size_t public_key_len)
+{
+	struct sshkem *kem = NULL;
+	size_t i, coeff_bytes;
+	unsigned int c0, c1;
+	int r = SSH_ERR_INVALID_FORMAT;
+
+	if (alg == NULL || public_key == NULL)
+		return SSH_ERR_INVALID_ARGUMENT;
+
+	if ((kem = ssh_kem_new(alg)) == NULL)
+		return SSH_ERR_INVALID_ARGUMENT;
+
+	/* FIPS 203 Section 7.2: encapsulation key type check. */
+	if (public_key_len != ssh_kem_public_key_len(kem) ||
+	    public_key_len < 32)
+		goto out;
+
+	/*
+	 * The final 32 bytes contain rho. The preceding bytes
+	 * encode pairs of 12-bit polynomial coefficients.
+	 */
+	coeff_bytes = public_key_len - 32;
+	if (coeff_bytes % 3 != 0)
+		goto out;
+
+	/*
+	 * FIPS 203 Section 7.2: modulus check.
+	 * Both coefficients must be in [0, 3328].
+	 */
+	for (i = 0; i < coeff_bytes; i += 3) {
+		c0 = (unsigned int)public_key[i] |
+		    (((unsigned int)public_key[i + 1] & 0x0fU) << 8);
+		c1 = ((unsigned int)public_key[i + 1] >> 4) |
+		    ((unsigned int)public_key[i + 2] << 4);
+
+		if (c0 >= 3329U || c1 >= 3329U)
+			goto out;
 	}
-	if (strcasecmp(buf, SSH_KEM_ALG_MLKEM512) == 0 ||
-	    strcasecmp(buf, "ML-KEM-512") == 0 ||
-	    strcasecmp(buf, "kyber512") == 0 ||
-	    strcasecmp(buf, "Kyber512") == 0)
-		return SSH_KEM_ALG_MLKEM512;
-	if (strcasecmp(buf, SSH_KEM_DEFAULT_ALG) == 0 ||
-	    strcasecmp(buf, "ML-KEM-768") == 0 ||
-	    strcasecmp(buf, "kyber768") == 0 ||
-	    strcasecmp(buf, "Kyber768") == 0)
-		return SSH_KEM_DEFAULT_ALG;
-	if (strcasecmp(buf, SSH_KEM_ALG_MLKEM1024) == 0 ||
-	    strcasecmp(buf, "ML-KEM-1024") == 0 ||
-	    strcasecmp(buf, "kyber1024") == 0 ||
-	    strcasecmp(buf, "Kyber1024") == 0)
-		return SSH_KEM_ALG_MLKEM1024;
-	return NULL;
+
+	r = 0;
+
+out:
+	ssh_kem_free(kem);
+	return r;
 }
 
 int
@@ -257,19 +414,6 @@ ssh_kem_names_valid(const char *names)
 	ret = 1;
 out:
 	free(list);
-	return ret;
-}
-
-char *
-ssh_kem_first_alg(const char *names)
-{
-	char *ret, *cp;
-
-	if (!ssh_kem_names_valid(names))
-		return NULL;
-	ret = xstrdup(names);
-	if ((cp = strchr(ret, ',')) != NULL)
-		*cp = '\0';
 	return ret;
 }
 
@@ -443,72 +587,119 @@ ssh_kem_identity_secret_key(const struct ssh_kem_identity *identity,
 }
 
 int
-ssh_kem_derive_response(struct ssh *ssh, const char *user,
-	const char *service, const char *method, const char *alg,
-    const u_char *public_key,
-    size_t public_key_len, const u_char *ciphertext, size_t ciphertext_len,
-    const u_char *shared_secret, size_t shared_secret_len, u_char *response,
-    size_t response_len)
+ssh_kem_build_mac_input(const u_char *sid, size_t sid_len,
+    const char *user, const char *service, const char *alg,
+    const u_char *public_key_blob, size_t public_key_blob_len,
+    const u_char *ciphertext, size_t ciphertext_len,
+    struct sshbuf **inputp)
 {
-	struct sshbuf *context = NULL;
-	struct ssh_hmac_ctx *hmac = NULL;
-	size_t digest_len;
-	int digest_alg;
-	int r = SSH_ERR_INTERNAL_ERROR;
+    struct sshbuf *ctx = NULL, *input = NULL;
+    int r = SSH_ERR_INTERNAL_ERROR;
 
-	if (ssh == NULL || ssh->kex == NULL || ssh->kex->session_id == NULL ||
-	    user == NULL || service == NULL || method == NULL || alg == NULL ||
-	    public_key == NULL ||
-	    ciphertext == NULL || shared_secret == NULL || response == NULL)
-		return SSH_ERR_INVALID_ARGUMENT;
-	if ((digest_alg = ssh_kem_response_digest(alg)) == -1)
-		return SSH_ERR_INVALID_ARGUMENT;
-	digest_len = ssh_hmac_bytes(digest_alg);
-	if (response_len < digest_len)
-		return SSH_ERR_INVALID_ARGUMENT;
-	if ((context = sshbuf_new()) == NULL)
-		return SSH_ERR_ALLOC_FAIL;
-	if ((r = sshbuf_put_u8(context, SSH2_MSG_USERAUTH_REQUEST)) != 0 ||
-	    (r = sshbuf_put_cstring(context, user)) != 0 ||
-	    (r = sshbuf_put_cstring(context, service)) != 0 ||
-	    (r = sshbuf_put_cstring(context, method)) != 0 ||
-	    (r = sshbuf_put_cstring(context, alg)) != 0 ||
-	    (r = sshbuf_put_string(context, public_key, public_key_len)) != 0 ||
-	    (r = sshbuf_put_u8(context, SSH2_MSG_USERAUTH_KEM_CHALLENGE)) != 0 ||
-	    (r = sshbuf_put_cstring(context, alg)) != 0 ||
-	    (r = sshbuf_put_string(context, public_key, public_key_len)) != 0 ||
-	    (r = sshbuf_put_string(context, ciphertext, ciphertext_len)) != 0)
-		goto out;
-	if ((hmac = ssh_hmac_start(digest_alg)) == NULL) {
-		r = SSH_ERR_ALLOC_FAIL;
-		goto out;
-	}
-	if ((r = ssh_hmac_init(hmac, shared_secret, shared_secret_len)) != 0 ||
-	    (r = ssh_hmac_update(hmac, SSH_KEM_CLIENT_AUTH_LABEL,
-	    sizeof(SSH_KEM_CLIENT_AUTH_LABEL) - 1)) != 0 ||
-	    (r = ssh_hmac_update(hmac, sshbuf_ptr(ssh->kex->session_id),
-	    sshbuf_len(ssh->kex->session_id))) != 0 ||
-	    (r = ssh_hmac_update_buffer(hmac, context)) != 0 ||
-	    (r = ssh_hmac_final(hmac, response,
-	    digest_len)) != 0)
-		goto out;
-	r = 0;
+    if (inputp != NULL)
+        *inputp = NULL;
+
+    if (sid == NULL || sid_len == 0 ||
+        user == NULL || service == NULL || alg == NULL ||
+        public_key_blob == NULL || public_key_blob_len == 0 ||
+        ciphertext == NULL || ciphertext_len == 0 ||
+        inputp == NULL ||
+        ssh_kem_normalize_name(alg) == NULL)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    if ((ctx = sshbuf_new()) == NULL ||
+        (input = sshbuf_new()) == NULL) {
+        r = SSH_ERR_ALLOC_FAIL;
+        goto out;
+    }
+
+    /*
+     * ctx: the exact authentication request, challenge,
+     * and response message type specified by the draft.
+     */
+    if ((r = sshbuf_put_u8(ctx,
+        SSH2_MSG_USERAUTH_REQUEST)) != 0 ||
+        (r = sshbuf_put_cstring(ctx, user)) != 0 ||
+        (r = sshbuf_put_cstring(ctx, service)) != 0 ||
+        (r = sshbuf_put_cstring(ctx,
+        SSH_KEM_AUTH_METHOD)) != 0 ||
+        (r = sshbuf_put_cstring(ctx, alg)) != 0 ||
+        (r = sshbuf_put_string(ctx, public_key_blob,
+        public_key_blob_len)) != 0 ||
+        (r = sshbuf_put_u8(ctx,
+        SSH2_MSG_USERAUTH_KEM_CHALLENGE)) != 0 ||
+        (r = sshbuf_put_cstring(ctx, alg)) != 0 ||
+        (r = sshbuf_put_string(ctx, public_key_blob,
+        public_key_blob_len)) != 0 ||
+        (r = sshbuf_put_string(ctx, ciphertext,
+        ciphertext_len)) != 0 ||
+        (r = sshbuf_put_u8(ctx,
+        SSH2_MSG_USERAUTH_KEM_RESPONSE)) != 0)
+        goto out;
+
+    /*
+     * MAC_input = label || SSH_string(sid) || ctx.
+     * The label is raw ASCII, without a length prefix.
+     */
+    if ((r = sshbuf_put(input,
+        SSH_KEM_CLIENT_AUTH_LABEL,
+        strlen(SSH_KEM_CLIENT_AUTH_LABEL))) != 0 ||
+        (r = sshbuf_put_string(input, sid, sid_len)) != 0 ||
+        (r = sshbuf_putb(input, ctx)) != 0)
+        goto out;
+
+    *inputp = input;
+    input = NULL;
+    r = 0;
+
 out:
-	ssh_hmac_free(hmac);
-	sshbuf_free(context);
-	return r;
+    sshbuf_free(ctx);
+    sshbuf_free(input);
+    return r;
 }
 
-#ifdef KEM_TEST_INSTRUMENTATION
-void
-kem_test_inc_pending(void)
+int
+ssh_kem_compute_confirmation(const u_char *sid, size_t sid_len,
+    const char *user, const char *service, const char *alg,
+    const u_char *public_key_blob, size_t public_key_blob_len,
+    const u_char *ciphertext, size_t ciphertext_len,
+    const u_char *shared_secret, size_t shared_secret_len,
+    u_char *ca, size_t ca_len)
 {
-	debug("KEM_PENDING_INC");
-}
+    struct sshbuf *mac_input = NULL;
+    struct ssh_hmac_ctx *hmac = NULL;
+    size_t expected_len;
+    int r;
 
-void
-kem_test_dec_pending(void)
-{
-	debug("KEM_PENDING_DEC");
+    expected_len = ssh_hmac_bytes(SSH_DIGEST_SHA256);
+
+    if (shared_secret == NULL || ca == NULL ||
+        shared_secret_len != 32 ||
+        ca_len != expected_len ||
+        ssh_kem_response_digest(alg) != SSH_DIGEST_SHA256)
+        return SSH_ERR_INVALID_ARGUMENT;
+
+    if ((r = ssh_kem_build_mac_input(sid, sid_len,
+        user, service, alg,
+        public_key_blob, public_key_blob_len,
+        ciphertext, ciphertext_len, &mac_input)) != 0)
+        return r;
+
+    if ((hmac = ssh_hmac_start(SSH_DIGEST_SHA256)) == NULL) {
+        r = SSH_ERR_ALLOC_FAIL;
+        goto out;
+    }
+
+    if ((r = ssh_hmac_init(hmac, shared_secret,
+        shared_secret_len)) != 0 ||
+        (r = ssh_hmac_update_buffer(hmac, mac_input)) != 0 ||
+        (r = ssh_hmac_final(hmac, ca, ca_len)) != 0)
+        goto out;
+
+    r = 0;
+
+out:
+    ssh_hmac_free(hmac);
+    sshbuf_free(mac_input);
+    return r;
 }
-#endif

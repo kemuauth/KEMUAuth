@@ -1,444 +1,121 @@
-# KEMUAuth: KEM-Based Client Authentication for Post-Quantum SSH
+# KEMUAuth
 
-KEMUAuth is a research implementation of **KEM-based client authentication for
-SSH**. It replaces signature-based client proof of possession with a KEM-based
-challenge-response mechanism while preserving the existing SSH transport
-handshake and the overall SSH user-authentication framework.
+KEMUAuth is an experimental OpenSSH-based reference implementation of the `publickey-kem` SSH user authentication method specified in [draft-liu-sshm-kem-userauth-00](https://datatracker.ietf.org/doc/draft-liu-sshm-kem-userauth/).
 
-This repository contains the OpenSSH-based implementation, build infrastructure,
-and evaluation scripts associated with the paper:
+## 1. Overview
 
-> **A Drop-in KEM Replacement for Client Signatures in Post-Quantum SSH**
-> Accepted at IEEE ICNP 2026.
+KEMUAuth replaces the client signature proof in SSH user authentication with a KEM challenge-response exchange. The server encapsulates a shared secret to an authorized client KEM public key, and the client demonstrates possession of the corresponding private key by returning a session-bound HMAC confirmation.
 
-## Repository Status
+The method preserves SSH transport key exchange and server host authentication.
 
-`main` is the **maintained development branch** of KEMUAuth.
+## 2. Specification
 
-The cleaned implementation and evaluation environment aligned with the ICNP
-2026 paper and the extended arXiv version is preserved on the
-`paper/icnp-2026` branch and by the `icnp-2026-paper-release` tag. The exact
-original research-artifact snapshot is preserved by the
-`icnp-2026-original-artifact` tag.
+This implementation targets **`draft-liu-sshm-kem-userauth-00`** and its `publickey-kem` authentication method.
 
-The paper-aligned release includes two narrowly scoped post-artifact robustness
-hardening changes: explicit client-side KEM ciphertext-length validation and
-safer test-only malformed-ciphertext mutation instrumentation. These changes do
-not alter the valid KEMUAuth protocol flow.
+The draft defines the protocol messages, wire encodings, algorithm identifiers, confirmation computation, and authentication state requirements. It serves as the protocol specification, while this repository provides a working implementation based on OpenSSH.
 
-Ongoing protocol, standards-oriented, implementation, and testing development
-takes place on `main`. The historical paper branch and release tags are
-preserved as stable reference points.
+## 3. Implementation Scope
 
-## KEMUAuth Overview
+The client and server support three authentication profiles:
 
-The KEMUAuth client-authentication method follows the SSH public-key
-authentication structure but replaces the client's signature proof with a
-KEM-based proof of possession.
+| Profile | KEM |
+| --- | --- |
+| `ssh-mlkem-512-hmac-sha256` | ML-KEM-512 |
+| `ssh-mlkem-768-hmac-sha256` | ML-KEM-768 |
+| `ssh-mlkem-1024-hmac-sha256` | ML-KEM-1024 |
 
-At a high level:
+ML-KEM-768 is the draft's recommended (`SHOULD`) profile and is used for the deterministic interoperability test vector in Appendix A. All three profiles are supported by the implementation and covered by the integration tests.
 
-1. The client advertises a KEM public key and KEMUAuth algorithm.
-2. The server encapsulates to the registered client KEM public key and returns
-   the resulting ciphertext as an authentication challenge.
-3. The client decapsulates the ciphertext and derives an authentication
-   response from the resulting shared secret and session-bound context.
-4. The server verifies the response and accepts the client authentication if
-   the proof is valid.
+Relevant OpenSSH configuration options include:
 
-The implementation is integrated at the SSH user-authentication layer and does
-not replace the SSH transport key exchange.
+- `KEMAuthentication` — enables or disables KEM-based user authentication.
+- `KEMAuthAlgorithms` — specifies permitted authentication profiles.
+- `IdentityKEMFile` — specifies the client's KEM identity file.
+- `AuthorizedKEMKeysFile` — specifies the server's authorized KEM public keys.
 
-The primary SSH authentication method implemented in this repository is:
+The implementation integrates with OpenSSH's `AuthenticationMethods` policy. KEMUAuth can be required as an authentication method or coexist with conventional SSH public-key authentication.
 
-```text
-publickey-kem
+KEM identity files use a three-line text format containing `algorithm`, `public` (Base64), and `secret` (Base64). Server authorization entries use the format `<profile> <Base64 raw public key>`. These are implementation-specific credential formats rather than SSH wire encodings. Identity files contain private key material and should be stored securely.
+
+## 4. Build
+
+The implementation has been tested on Ubuntu 22.04 under WSL2. Building requires a Linux development environment, OpenSSL development headers, liboqs, and standard C build tools.
+
+On Ubuntu, common prerequisites can be installed with:
+
+```sh
+sudo apt-get install -y autoconf automake libtool make gcc g++ \
+    pkg-config libssl-dev zlib1g-dev python3 iproute2
 ```
 
-The source tree also contains experimental hybrid authentication paths used by
-the paper's migration evaluation.
+From the repository root, prepare liboqs and build the modified OpenSSH implementation:
 
-## Source-Code Map
-
-The most relevant KEMUAuth implementation files include:
-
-```text
-ssh-kem.c
-ssh-kem.h
-auth2-kem.c
-auth2-kem.h
-```
-
-Client-side SSH integration is implemented in the modified OpenSSH client
-authentication path, while server-side processing is integrated into the
-OpenSSH user-authentication subsystem.
-
-The remainder of the repository contains the underlying OpenSSH/OQS-OpenSSH
-source tree and supporting build infrastructure.
-
-## Repository Layout
-
-```text
-.
-├── ssh-kem.c / ssh-kem.h
-│   └── Shared KEMUAuth/KEM support
-├── auth2-kem.c / auth2-kem.h
-│   └── Server-side KEMUAuth user authentication
-├── oqs-scripts/
-│   └── liboqs and OpenSSH build helpers
-├── testScripts/
-│   ├── figure3/
-│   ├── figure4/
-│   ├── figure5/
-│   ├── concurrency/
-│   ├── network_sensitivity/
-│   ├── implementation_checks/
-│   └── backends/
-└── README.md
-```
-
-For experiment-specific documentation, see:
-
-```text
-testScripts/README.md
-```
-
-## Build Environment
-
-The paper evaluation environment uses:
-
-- Ubuntu 22.04.5 LTS
-- GCC 11.4
-- OpenSSL 3.0.2
-- liboqs 0.15.0
-- AVX2-enabled compilation where supported
-
-A Linux environment is strongly recommended. Several evaluation scripts also
-require `sudo` privileges for Linux network configuration.
-
-### Install Build Dependencies
-
-On Ubuntu/Debian:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  autoconf \
-  automake \
-  libtool \
-  make \
-  gcc \
-  g++ \
-  pkg-config \
-  libssl-dev \
-  zlib1g-dev
-```
-
-### Build liboqs
-
-From the repository root:
-
-```bash
+```sh
 LIBOQS_BRANCH=0.15.0 bash oqs-scripts/clone_liboqs.sh
 bash oqs-scripts/build_liboqs.sh
-```
-
-The repository-local liboqs installation is placed under:
-
-```text
-oqs/
-```
-
-### Build KEMUAuth / OQS-OpenSSH
-
-Run:
-
-```bash
 bash oqs-scripts/build_openssh.sh
+make ssh sshd sshd-session sshd-auth ssh-keygen
 ```
 
-After a successful build, KEMUAuth-enabled OpenSSH binaries such as:
+The build uses repository-local source and libraries. The integration tests run the locally built SSH binaries without installing or replacing the system SSH service.
 
-```text
-ssh
-sshd
-ssh-keygen
+## 5. Quick Start
+
+The simplest way to run KEMUAuth is through the automated integration suite:
+
+```sh
+bash tests/integration/run.sh
 ```
 
-are available from the repository build tree.
+The script generates temporary credentials for all three ML-KEM profiles, prepares an Ed25519 server host key and authorization files, and launches an isolated SSH server on `127.0.0.1:42222`.
 
-A successful KEMUAuth build can also be checked with:
+It then performs the authentication tests, records the results, and stops the test server. The port can be changed using `KEMUAUTH_TEST_PORT`. The tests run locally without root privileges.
 
-```bash
-grep WITH_OQS config.h
+For examples of manual client and server configuration, see the `sshd_config` generation and SSH client invocations in `tests/integration/run.sh`.
+
+## 6. Testing
+
+Run all maintained tests from the repository root:
+
+```sh
+bash tests/run.sh
 ```
 
-and by inspecting the supported OpenSSH algorithms.
+Individual test categories can also be selected:
 
-## Paper Reproduction
-
-The evaluation scripts are organized according to the final paper rather than
-the internal experiment numbering used during development.
-
-### Figure 3 — Client-Authentication Algorithm Comparison
-
-```bash
-sudo bash testScripts/figure3/run
+```sh
+bash tests/run.sh --vectors
+bash tests/run.sh --integration
 ```
 
-Figure 3 compares classical signatures, post-quantum signatures, KEMUAuth
-configurations, and the password baseline under a fixed network environment.
+**Protocol vectors.** The vector suite verifies the deterministic ML-KEM-768 example in Appendix A of the draft. It checks SSH message encoding, confirmation input construction, and HMAC-SHA256 computation using C and Python implementations.
 
-Documentation:
+The reference data is stored in `tests/protocol/mlkem768-vector.json`. The vector can also be regenerated for future draft revisions using the corresponding Makefile target.
 
-```text
-testScripts/figure3/README.md
-```
+**Integration tests.** The integration suite covers successful authentication with all three ML-KEM profiles, unauthorized-key rejection, incorrect confirmation rejection, authentication policy enforcement, permitted fallback, authorization revocation, and Challenge cancellation.
 
-Published paper values:
+Generated credentials, temporary programs, configurations, and logs are stored under the Git-ignored `tests/integration/.work/` directory.
 
-```text
-testScripts/figure3/published_results.md
-```
+See [tests/README.md](tests/README.md) for the complete test descriptions and commands.
 
-### Figure 4 — Migration Configurations across RTT Regimes
+## 7. Limitations
 
-```bash
-bash testScripts/figure4/run
-```
+This implementation focuses on protocol correctness and basic SSH interoperability. The current tests cover the modified OpenSSH client and server, including selected authentication failure and state-management scenarios.
 
-Figure 4 evaluates eight client/server authentication migration configurations
-under approximately 37 ms, 67 ms, and 163 ms RTTs.
+Independent cross-implementation interoperability, extensive performance evaluation, comprehensive security testing, and production deployment hardening are outside the current scope. SSH agent and certificate integration, as well as broader multi-factor authentication combinations, have not been comprehensively evaluated.
 
-The paper-aligned runner explicitly selects the combined classical/post-quantum
-authentication paths used by the hybrid configurations.
+The implementation is intended for protocol research and interoperability evaluation rather than production deployment.
 
-Documentation:
+## 8. History, Citation and License
 
-```text
-testScripts/figure4/README.md
-```
+The original KEMUAuth implementation was developed for the IEEE ICNP 2026 paper *A Drop-in KEM Replacement for Client Signatures in Post-Quantum SSH*.
 
-Published paper values:
+The earlier research and evaluation versions remain available through Git history:
 
-```text
-testScripts/figure4/published_results.md
-```
+- `paper/icnp-2026` — the ICNP 2026 evaluation branch.
+- `icnp-2026-paper-release` — the public paper-release tag.
+- `icnp-2026-original-artifact` — the original research artifact.
 
-### Figure 5 — TCP Initial-Window Sensitivity
+The current implementation focuses on the Internet-Draft and its interoperability tests, while the historical versions preserve the original experimental work.
 
-```bash
-bash testScripts/figure5/run
-```
-
-Figure 5 studies authentication-object transmission effects by varying the TCP
-initial congestion window over:
-
-```text
-3 5 7 10 15 20 25 30 35 40 50 MSS
-```
-
-Documentation:
-
-```text
-testScripts/figure5/README.md
-```
-
-Published paper values:
-
-```text
-testScripts/figure5/published_results.md
-```
-
-### Run the Three Main Figure Experiments
-
-The main paper experiment runners can be invoked sequentially with:
-
-```bash
-bash testScripts/run_main_figures
-```
-
-The default runners intentionally use reduced sample counts so that users can
-validate the build, authentication configuration, networking setup, and
-result-processing pipeline without immediately executing the complete
-paper-scale campaign.
-
-The paper-scale end-to-end measurements use 5,000 measured SSH handshakes per
-configuration. See each figure-specific README for the corresponding
-reproduction command and experiment-specific settings.
-
-## Published Results and Local Reproduction
-
-The repository distinguishes between the numerical results reported in the
-paper and results generated by a new local execution.
-
-Files named:
-
-```text
-published_results.md
-```
-
-contain the canonical values reported in the paper.
-
-Files generated under experiment-specific:
-
-```text
-results/
-```
-
-directories represent a new local reproduction run.
-
-Timing measurements may vary across machines because of hardware, CPU
-frequency, kernel behavior, scheduling, system load, and networking
-configuration. The published values therefore serve as reference measurements,
-not platform-independent performance guarantees.
-
-## Extended Evaluation
-
-The extended evaluation is organized independently from the three main figure
-experiments.
-
-### Concurrency
-
-```text
-testScripts/concurrency/
-```
-
-This evaluation studies server-side behavior under concurrent KEMUAuth
-connections, including:
-
-```text
-throughput_cgroup/
-pending_memory/
-```
-
-Entry point:
-
-```bash
-bash testScripts/concurrency/run
-```
-
-Some concurrency measurements require cgroup v2 and the
-`KEM_TEST_INSTRUMENTATION` build option.
-
-### Network Sensitivity
-
-```text
-testScripts/network_sensitivity/
-```
-
-This evaluation contains:
-
-```text
-rtt_scan/
-loss/
-```
-
-and studies handshake behavior across a denser RTT range and under random
-packet loss.
-
-Entry point:
-
-```bash
-bash testScripts/network_sensitivity/run --mode all
-```
-
-Individual modes are available through:
-
-```bash
-bash testScripts/network_sensitivity/run --mode rtt
-bash testScripts/network_sensitivity/run --mode loss
-```
-
-### Ciphertext Robustness
-
-```text
-testScripts/implementation_checks/ciphertext_robustness/
-```
-
-This implementation check evaluates malformed-ciphertext handling and related
-timing behavior.
-
-Entry point:
-
-```bash
-bash testScripts/implementation_checks/ciphertext_robustness/run
-```
-
-It requires the `KEM_TEST_MUTATION` build option.
-
-Detailed requirements and result descriptions for these evaluations are
-documented under their respective directories.
-
-## Runtime Workspaces
-
-Some experiment scripts generate temporary SSH/KEM identities and runtime
-configuration files.
-
-In particular:
-
-```text
-testScripts/.work-kem/
-```
-
-is used as a local runtime workspace for generated KEM identity material.
-
-Runtime workspaces are excluded by `.gitignore` and must not be committed to
-the repository.
-
-## Project and Artifact History
-
-The original ICNP 2026 research artifact was released through an anonymous
-GitHub account during the paper-review process and is preserved at:
-
-https://github.com/bhivfsadh/KEM-Based-User-Authentication-for-Post-Quantum-SSH
-
-That repository is archived as the historical artifact entry point and directs
-visitors to this maintained KEMUAuth project.
-
-Within this repository, the tag `icnp-2026-original-artifact` identifies the
-exact original artifact snapshot. The branch `paper/icnp-2026` contains the
-cleaned and documented paper-aligned implementation, and the tag
-`icnp-2026-paper-release` identifies that public paper release.
-
-Ongoing project and standards-oriented development takes place on `main`.
-
-## Reproducibility Notes
-
-Network-sensitive experiments use Linux facilities such as:
-
-```text
-tc/netem
-ip route
-```
-
-and therefore commonly require root or `sudo` privileges.
-
-The evaluation scripts launch dedicated local SSH server instances for
-measurement and do not replace the host system's SSH daemon.
-
-Temporary keys, runtime configuration, and locally reproduced results should
-not be interpreted as source artifacts or published measurements.
-
-## Citation
-
-If you use KEMUAuth in academic work, please cite:
-
-> **A Drop-in KEM Replacement for Client Signatures in Post-Quantum SSH**
-> IEEE ICNP 2026.
-
-Complete proceedings metadata and persistent publication identifiers can be
-added here once the final bibliographic record is available.
-
-## License
-
-This repository incorporates and modifies OpenSSH/OQS-OpenSSH source code and
-includes components distributed under their respective licenses.
-
-See:
-
-```text
-LICENCE
-```
-
-and the upstream source headers for the applicable licensing terms.
+This repository incorporates OpenSSH / OQS-OpenSSH and related components. See [LICENCE](LICENCE) and the individual source-file notices for applicable licenses.

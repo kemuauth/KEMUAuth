@@ -5,7 +5,6 @@ struct Authmethod;
 struct ssh;
 
 extern struct Authmethod method_kem;
-extern struct Authmethod method_kem_and;
 
 void auth2_kem_stop(struct ssh *ssh);
 

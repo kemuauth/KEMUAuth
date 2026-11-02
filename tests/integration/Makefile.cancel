@@ -1,0 +1,21 @@
+# Build a disposable SSH client for Challenge-cancellation integration tests.
+# Load this fragment alongside the configured top-level Makefile.
+KEMU_CANCEL_DIR ?= tests/integration/.work/cancel-build
+KEMU_CANCEL_SRC = $(KEMU_CANCEL_DIR)/sshconnect2-cancel.c
+KEMU_CANCEL_OBJ = $(KEMU_CANCEL_DIR)/sshconnect2-cancel.o
+KEMU_CANCEL_BIN = $(KEMU_CANCEL_DIR)/ssh-kem-cancel
+KEMU_CANCEL_BASE_OBJS = $(filter-out sshconnect2.o,$(SSHOBJS))
+
+.PHONY: kem-cancel-client
+kem-cancel-client: $(KEMU_CANCEL_BIN)
+
+$(KEMU_CANCEL_SRC): sshconnect2.c tests/integration/build_cancel_client.py
+	@mkdir -p $(KEMU_CANCEL_DIR)
+	python3 tests/integration/build_cancel_client.py $< $@
+
+$(KEMU_CANCEL_OBJ): $(KEMU_CANCEL_SRC)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(KEMU_CANCEL_BIN): $(KEMU_CANCEL_OBJ) $(KEMU_CANCEL_BASE_OBJS) libssh.a $(LIBCOMPAT)
+	$(LD) -o $@ $(KEMU_CANCEL_BASE_OBJS) $(KEMU_CANCEL_OBJ) $(LDFLAGS) \
+	    -lssh -lopenbsd-compat $(LIBS) $(GSSLIBS) $(CHANNELLIBS)

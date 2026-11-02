@@ -76,7 +76,6 @@
 /* import */
 extern ServerOptions options;
 extern struct authmethod_cfg methodcfg_pubkey;
-extern struct authmethod_cfg methodcfg_pubkey_hybrid_and;
 
 static char *
 format_key(const struct sshkey *key)
@@ -879,10 +878,5 @@ user_key_allowed(struct ssh *ssh, struct passwd *pw, struct sshkey *key,
 
 Authmethod method_pubkey = {
 	&methodcfg_pubkey,
-	userauth_pubkey,
-};
-
-Authmethod method_pubkey_hybrid_and = {
-	&methodcfg_pubkey_hybrid_and,
 	userauth_pubkey,
 };
