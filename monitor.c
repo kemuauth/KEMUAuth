@@ -766,8 +766,11 @@ mm_answer_kem_init(struct ssh *ssh, int sock, struct sshbuf *m)
 	struct sshbuf *reply;
 	struct sshkem *kem = NULL;
 	u_char *public_key = NULL, *ciphertext = NULL, *shared_secret = NULL;
+	u_char *decoded_public_key = NULL;
+	const u_char *kem_public_key = NULL;
 	u_char *expected = NULL;
 	size_t public_key_len = 0, ciphertext_len = 0, shared_secret_len = 0;
+	size_t decoded_public_key_len = 0, kem_public_key_len = 0;
 	char *method = NULL, *alg = NULL;
 	u_int allowed = 0;
 	int r;
@@ -783,10 +786,37 @@ mm_answer_kem_init(struct ssh *ssh, int sock, struct sshbuf *m)
 
 	monitor_reset_key_state();
 
+	/*
+	* The draft method carries an SSH public key blob.
+	* Decode it before authorization and KEM encapsulation.
+	*/
+	if (strcmp(method, SSH_KEM_AUTH_METHOD) == 0) {
+		if (ssh_kem_decode_public_key_blob(
+			alg, public_key, public_key_len,
+			&decoded_public_key, &decoded_public_key_len) != 0)
+			goto out;
+			
+		if (ssh_kem_validate_public_key(alg,
+			decoded_public_key, decoded_public_key_len) != 0)
+			goto out;
+
+		kem_public_key = decoded_public_key;
+		kem_public_key_len = decoded_public_key_len;
+	} else if (strcmp(method, SSH_KEM_AND_AUTH_METHOD) == 0) {
+		/*
+		* Legacy experimental method still carries a raw key.
+		*/
+		kem_public_key = public_key;
+		kem_public_key_len = public_key_len;
+	} else {
+		goto out;
+	}
+
 	if (!options.kem_authentication || !authctxt->valid ||
 	    !ssh_kem_name_permitted(options.kem_auth_algorithms, alg) ||
 	    !auth2_method_allowed(authctxt, method, alg) ||
-	    !kem_key_allowed(authctxt->pw, alg, public_key, public_key_len) ||
+	    !kem_key_allowed(authctxt->pw, alg,
+    	kem_public_key, kem_public_key_len) ||
 	    (kem = ssh_kem_new(alg)) == NULL)
 		goto out;
 
@@ -800,13 +830,36 @@ mm_answer_kem_init(struct ssh *ssh, int sock, struct sshbuf *m)
 		goto out;
 	}
 	expected = xcalloc(kem_expected_response_len, sizeof(*expected));
-	if ((r = ssh_kem_encaps(kem, ciphertext, shared_secret, public_key)) != 0 ||
-	    (r = kem_derive_response_monitor(authctxt->user, authctxt->service,
-	    method,
-	    alg, public_key, public_key_len,
-	    ciphertext, ciphertext_len,
-	    shared_secret, shared_secret_len, expected,
-	    kem_expected_response_len)) != 0)
+	
+	/* Encapsulate to the decoded raw ML-KEM public key. */
+	if ((r = ssh_kem_encaps(kem, ciphertext,
+		shared_secret, kem_public_key)) != 0)
+		goto out;
+
+	/*
+	* The draft method uses the same confirmation computation
+	* as the client, with the exact SSH public key blob.
+	*/
+	if (strcmp(method, SSH_KEM_AUTH_METHOD) == 0) {
+		r = ssh_kem_compute_confirmation(
+			session_id2, session_id2_len,
+			authctxt->user, authctxt->service, alg,
+			public_key, public_key_len,
+			ciphertext, ciphertext_len,
+			shared_secret, shared_secret_len,
+			expected, kem_expected_response_len);
+	} else {
+		/* Preserve the legacy experimental computation. */
+		r = kem_derive_response_monitor(
+			authctxt->user, authctxt->service,
+			method, alg,
+			kem_public_key, kem_public_key_len,
+			ciphertext, ciphertext_len,
+			shared_secret, shared_secret_len,
+			expected, kem_expected_response_len);
+	}
+
+	if (r != 0)
 		goto out;
 
 	kem_expected_response = expected;
@@ -828,6 +881,7 @@ out:
 	free(method);
 	free(alg);
 	free(public_key);
+	free(decoded_public_key);
 	free(ciphertext);
 	freezero(shared_secret, shared_secret_len);
 	freezero(expected, kem_expected_response_len);

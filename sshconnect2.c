@@ -418,8 +418,12 @@ struct cauthmethod {
 };
 
 struct kem_client_ctx {
-	struct ssh_kem_identity *identity;
-	char *packet_method;
+    struct ssh_kem_identity *identity;
+    char *packet_method;
+
+    /* Exact values used in the pending publickey-kem request. */
+    char *request_alg;
+    struct sshbuf *public_key_blob;
 };
 
 static int input_userauth_service_accept(int, u_int32_t, struct ssh *);
@@ -1176,18 +1180,33 @@ userauth_kem(struct ssh *ssh)
 		free(ctx);
 		return 0;
 	}
+
+	/* Build and retain the exact SSH public key blob. */
+	if ((r = ssh_kem_encode_public_key_blob(alg,
+		public_key, public_key_len, &ctx->public_key_blob)) != 0) {
+		ssh_kem_identity_free(ctx->identity);
+		free(ctx->packet_method);
+		free(alg);
+		free(ctx);
+		return 0;
+	}
+
+	/* Retain the selected authentication algorithm for echo checking. */
+	ctx->request_alg = alg;
+	alg = NULL;
+
 	authctxt->methoddata = ctx;
 	if ((r = sshpkt_start(ssh, SSH2_MSG_USERAUTH_REQUEST)) != 0 ||
 	    (r = sshpkt_put_cstring(ssh, authctxt->server_user)) != 0 ||
 	    (r = sshpkt_put_cstring(ssh, authctxt->service)) != 0 ||
 	    (r = sshpkt_put_cstring(ssh, authctxt->method->name)) != 0 ||
-	    (r = sshpkt_put_cstring(ssh, alg)) != 0 ||
-	    (r = sshpkt_put_string(ssh, public_key, public_key_len)) != 0 ||
+		(r = sshpkt_put_cstring(ssh, ctx->request_alg)) != 0 ||
+		(r = sshpkt_put_stringb(ssh, ctx->public_key_blob)) != 0 ||
 	    (r = sshpkt_send(ssh)) != 0)
 		fatal_fr(r, "send packet");
 	ssh_dispatch_set(ssh, SSH2_MSG_USERAUTH_KEM_CHALLENGE,
 	    &input_userauth_kem_info_req);
-	free(alg);
+
 	return 1;
 }
 
@@ -1335,6 +1354,12 @@ userauth_kem_cleanup(struct ssh *ssh)
 	ctx->identity = NULL;
 	free(ctx->packet_method);
 	ctx->packet_method = NULL;
+
+	free(ctx->request_alg);
+	ctx->request_alg = NULL;
+
+	sshbuf_free(ctx->public_key_blob);
+	ctx->public_key_blob = NULL;
 }
 
 static int
@@ -1369,13 +1394,42 @@ input_userauth_kem_info_req(int type, u_int32_t seq, struct ssh *ssh)
 		}
 	}
 #endif
-	if (!ssh_kem_name_equal(alg, ssh_kem_identity_alg(ctx->identity))) {
+	public_key = ssh_kem_identity_public_key(ctx->identity,
+		&public_key_len);
+	if (public_key == NULL) {
 		r = SSH_ERR_INVALID_FORMAT;
 		goto out;
 	}
-	public_key = ssh_kem_identity_public_key(ctx->identity, &public_key_len);
-	if (echoed_key_len != public_key_len ||
-	    memcmp(echoed_key, public_key, public_key_len) != 0) {
+
+	if (ctx->packet_method != NULL &&
+		strcmp(ctx->packet_method, SSH_KEM_AUTH_METHOD) == 0) {
+		/*
+		* The draft requires byte-for-byte equality with the
+		* algorithm and public key blob in the pending request.
+		*/
+		if (ctx->request_alg == NULL ||
+			ctx->public_key_blob == NULL ||
+			strcmp(alg, ctx->request_alg) != 0 ||
+			echoed_key_len != sshbuf_len(ctx->public_key_blob) ||
+			memcmp(echoed_key, sshbuf_ptr(ctx->public_key_blob),
+			echoed_key_len) != 0) {
+			r = SSH_ERR_INVALID_FORMAT;
+			goto out;
+		}
+	} else if (ctx->packet_method != NULL &&
+		strcmp(ctx->packet_method, SSH_KEM_AND_AUTH_METHOD) == 0) {
+		/*
+		* Legacy experimental method. This path will be removed
+		* from the draft reference implementation.
+		*/
+		if (!ssh_kem_name_equal(alg,
+			ssh_kem_identity_alg(ctx->identity)) ||
+			echoed_key_len != public_key_len ||
+			memcmp(echoed_key, public_key, public_key_len) != 0) {
+			r = SSH_ERR_INVALID_FORMAT;
+			goto out;
+		}
+	} else {
 		r = SSH_ERR_INVALID_FORMAT;
 		goto out;
 	}
@@ -1394,14 +1448,59 @@ input_userauth_kem_info_req(int type, u_int32_t seq, struct ssh *ssh)
 	secret_key = ssh_kem_identity_secret_key(ctx->identity, &secret_key_len);
 	shared_secret = xcalloc(ssh_kem_shared_secret_len(kem), sizeof(*shared_secret));
 	response = xcalloc(response_len, sizeof(*response));
-	if ((r = ssh_kem_decaps(kem, shared_secret, ciphertext, secret_key)) != 0 ||
-	    (r = ssh_kem_derive_response(ssh, authctxt->server_user,
-	    authctxt->service,
-	    ctx->packet_method != NULL ? ctx->packet_method : SSH_KEM_AUTH_METHOD,
-	    alg, public_key, public_key_len,
-	    ciphertext, ciphertext_len, shared_secret,
-	    ssh_kem_shared_secret_len(kem), response, response_len)) != 0)
+	
+	/* Recover the shared secret from the received challenge. */
+	if ((r = ssh_kem_decaps(kem, shared_secret,
+		ciphertext, secret_key)) != 0)
 		goto out;
+
+	/*
+	* Compute the session-bound confirmation value.
+	* The draft method uses the exact encoded request fields.
+	*/
+	if (ctx->packet_method != NULL &&
+		strcmp(ctx->packet_method, SSH_KEM_AUTH_METHOD) == 0) {
+		if (ssh->kex == NULL ||
+			ssh->kex->session_id == NULL ||
+			ctx->request_alg == NULL ||
+			ctx->public_key_blob == NULL) {
+			r = SSH_ERR_INVALID_ARGUMENT;
+			goto out;
+		}
+
+		r = ssh_kem_compute_confirmation(
+			sshbuf_ptr(ssh->kex->session_id),
+			sshbuf_len(ssh->kex->session_id),
+			authctxt->server_user,
+			authctxt->service,
+			ctx->request_alg,
+			sshbuf_ptr(ctx->public_key_blob),
+			sshbuf_len(ctx->public_key_blob),
+			ciphertext,
+			ciphertext_len,
+			shared_secret,
+			ssh_kem_shared_secret_len(kem),
+			response,
+			response_len);
+	} else if (ctx->packet_method != NULL &&
+		strcmp(ctx->packet_method, SSH_KEM_AND_AUTH_METHOD) == 0) {
+		/* Legacy experimental method, pending removal. */
+		r = ssh_kem_derive_response(ssh,
+			authctxt->server_user,
+			authctxt->service,
+			ctx->packet_method,
+			alg, public_key, public_key_len,
+			ciphertext, ciphertext_len,
+			shared_secret,
+			ssh_kem_shared_secret_len(kem),
+			response, response_len);
+	} else {
+		r = SSH_ERR_INVALID_FORMAT;
+	}
+
+	if (r != 0)
+		goto out;
+
 	if ((r = sshpkt_start(ssh, SSH2_MSG_USERAUTH_KEM_RESPONSE)) != 0 ||
 	    (r = sshpkt_put_string(ssh, response, response_len)) != 0 ||
 	    (r = sshpkt_send(ssh)) != 0)

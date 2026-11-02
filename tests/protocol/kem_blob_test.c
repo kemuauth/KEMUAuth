@@ -49,6 +49,12 @@ main(void)
     REQUIRE(ssh_kem_keypair(kem, pk, sk) == 0,
         "ML-KEM-768 key generation");
 
+    REQUIRE(ssh_kem_validate_public_key(alg, pk, pk_len) == 0,
+        "valid ML-KEM-768 encapsulation key");
+
+    REQUIRE(ssh_kem_validate_public_key(alg, pk, pk_len - 1) != 0,
+        "reject incorrect encapsulation key length");
+
     /* Encode the public key blob. */
     REQUIRE(ssh_kem_encode_public_key_blob(
         alg, pk, pk_len, &blob) == 0,
@@ -119,6 +125,19 @@ main(void)
     REQUIRE(ssh_kem_encode_public_key_blob(
         alg, pk, pk_len - 1, &invalid_blob) != 0,
         "reject incorrect raw public key length");
+
+    /*
+    * Corrupt the first 12-bit coefficient to 4095.
+    * The structural length remains valid, but the key
+    * must fail the FIPS 203 modulus check.
+    *
+    * No further use of the original public key follows.
+    */
+    pk[0] = 0xff;
+    pk[1] = (pk[1] & 0xf0) | 0x0f;
+
+    REQUIRE(ssh_kem_validate_public_key(alg, pk, pk_len) != 0,
+        "reject non-canonical ML-KEM public key");
 
     printf("PASS: ML-KEM-768 public key blob tests\n");
     printf("  Raw key: %zu bytes\n", pk_len);

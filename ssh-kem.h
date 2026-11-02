@@ -39,6 +39,10 @@ int ssh_kem_decode_public_key_blob(const char *alg,
     const u_char *blob, size_t blob_len,
     u_char **public_keyp, size_t *public_key_lenp);
 
+/* Check an ML-KEM encapsulation key according to FIPS 203 Section 7.2. */
+int ssh_kem_validate_public_key(const char *alg,
+    const u_char *public_key, size_t public_key_len);
+
 struct sshkem *ssh_kem_new(const char *name);
 void ssh_kem_free(struct sshkem *kem);
 size_t ssh_kem_public_key_len(struct sshkem *kem);
@@ -73,6 +77,21 @@ int ssh_kem_derive_response(struct ssh *ssh, const char *user,
     size_t public_key_len, const u_char *ciphertext, size_t ciphertext_len,
     const u_char *shared_secret, size_t shared_secret_len, u_char *response,
     size_t response_len);
+
+/* Build the exact MAC_input defined by the publickey-kem draft. */
+int ssh_kem_build_mac_input(const u_char *sid, size_t sid_len,
+    const char *user, const char *service, const char *alg,
+    const u_char *public_key_blob, size_t public_key_blob_len,
+    const u_char *ciphertext, size_t ciphertext_len,
+    struct sshbuf **inputp);
+
+/* Compute the ML-KEM profile's 32-octet confirmation value. */
+int ssh_kem_compute_confirmation(const u_char *sid, size_t sid_len,
+    const char *user, const char *service, const char *alg,
+    const u_char *public_key_blob, size_t public_key_blob_len,
+    const u_char *ciphertext, size_t ciphertext_len,
+    const u_char *shared_secret, size_t shared_secret_len,
+    u_char *ca, size_t ca_len);
 
 #ifdef KEM_TEST_INSTRUMENTATION
 void kem_test_inc_pending(void);
